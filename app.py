@@ -35,15 +35,39 @@ st.set_page_config(
 # ---------- シンプルCSS（白ベース＋小説明） ----------
 st.markdown("""
 <style>
-.small { font-size: 0.92rem; color: #666; }
-.big { font-size: 1.08rem; font-weight: 700; }
-.badge { display:inline-block; padding:2px 10px; border-radius:999px; background:#eef; margin-right:6px; }
+/* ===== グローバル（白ベースで文字は濃く） ===== */
+html, body, [data-testid="stAppViewContainer"] * {
+  color: #111111 !important;
+}
+[data-testid="stAppViewContainer"] {
+  background: #FFFFFF !important;
+}
+[data-testid="stHeader"] {
+  background: #FFFFFF !important;
+}
+a, a:visited {
+  color: #0E7AFE !important;
+  text-decoration: none;
+}
+
+/* ===== セクションの薄背景など ===== */
+.hint {
+  background:#f7f7ff;
+  padding:10px 12px;
+  border-radius:10px;
+}
+
+/* ===== 小さな説明・見出し装飾 ===== */
+.small { font-size: 0.92rem; color: #444 !important; }
+.big   { font-size: 1.08rem; font-weight: 700; color:#111 !important; }
+
+.badge { display:inline-block; padding:2px 10px; border-radius:999px; background:#eef; margin-right:6px; color:#111 !important; }
 .badge-strong { background:#e8f5e9; }
-.hint { background:#f7f7ff; padding:10px 12px; border-radius:10px; }
+
+/* ===== 表（モバイル読みやすさ） ===== */
 .tbl th, .tbl td { font-size: 0.95rem; }
 </style>
 """, unsafe_allow_html=True)
-
 st.title("⛵ レース診断（1レース）")
 st.caption("このレースの“全体像”を、人気の偏りと当てやすさで見える化します。")
 
