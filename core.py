@@ -1,34 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-core.py
+core.py  —  “オッズだけで読む”競艇AIコア（全文）
 
-―― このファイルが担うこと ――
-- 公式サイト由来のデータを pyjpboatrace 経由で取得
-  - 三連複オッズ（get_odds_trio）
-  - 三連単オッズ（get_odds_trifecta）
-  - 直前情報（展示ほか）（get_just_before_info）
-  - レース結果（get_race_result）
-- 三連複オッズだけから“確率”を作り（Top10を正規化）、三連単へ順序分解
-- 指標（固さ、1号艇含有、ペア質量、1着見込みなど）の計算
-- EV判定（割に合うか）、点数の自動絞り（6〜8点推奨・同一ペア制限）、資金配分（100円刻み）
-- バックテスト向けの最低限のI/F（実配当取得／フォールバック用）
+この版の主なチューニング（当たりが付きにくい状況を改善）:
+  1) 3連複TopNの確率化の柔らかさ α を 0.9 に（既定値）
+     - 上位セットの重みをやや強調して、順序分解後の“当たりやすい列”を厚めに。
+  2) 3複→3単の候補生成で “最有力パターンの強制スキップ” を廃止（avoid_top=False）
+     - 本命1点を素直に候補へ含める（過熱対策はEV側で担保）。
+  3) EV判定に長穴（25倍以上）だけ 2pp の救済
+     - モデル誤差が大きい高配当帯で、過度に落ちるのを緩和。
+  4) “固さ”に応じた採用セット数Rを全体に+1（候補母集団を少し広げる）
 
-※ 外部依存は pyjpboatrace のみ（v0.4.x 想定）。
-※ ファイルは “省略なし” で記載しています。
+アプリ側（1レース診断/日次バックテスト）の I/F は互換です。
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple, List, Optional, Iterable
+from typing import Dict, Tuple, List, Optional, Any
 from collections import defaultdict, Counter
 from datetime import date
 
-# ========== 型エイリアス ==========
-TrioSet = frozenset  # frozenset({a,b,c}) を 3連複セットのキーに使う
-Order3 = Tuple[int, int, int]  # (i, j, k) = 3連単の順序付きタプル
+# ========= 型 =========
+TrioSet = frozenset          # frozenset({a,b,c}) を3連複セットのキーに
+Order3 = Tuple[int, int, int]  # (i, j, k) = 3連単の順序タプル
 
-
-# ========== 会場マスタ ==========
+# ========= 会場マスタ =========
 VENUES: List[Tuple[int, str]] = [
     (1, "桐生"), (2, "戸田"), (3, "江戸川"), (4, "平和島"),
     (5, "多摩川"), (6, "浜名湖"), (7, "蒲郡"), (8, "常滑"),
@@ -39,45 +35,34 @@ VENUES: List[Tuple[int, str]] = [
 ]
 VENUE_ID2NAME = {vid: name for vid, name in VENUES}
 
-
-# ========== 順序分解の重み（バイアス） ==========
-# 内枠優勢を表現する軽いバイアス。チューニング可。
+# ========= 順序分解の軽いバイアス（内枠優勢を控えめに反映） =========
 HEAD_BIAS = {1: 1.35, 2: 1.05, 3: 0.95, 4: 0.85, 5: 0.80, 6: 0.75}
 MID_BIAS  = {1: 1.20, 2: 1.05, 3: 1.00, 4: 0.95, 5: 0.90, 6: 0.85}
 TAIL_BIAS = {1: 1.10, 2: 1.05, 3: 1.02, 4: 1.00, 5: 0.98, 6: 0.96}
 
-
-# ========== データ取得（pyjpboatrace） ==========
+# ========= データ取得（pyjpboatrace） =========
 try:
-    from pyjpboatrace import PyJPBoatrace  # v0.4.x
+    from pyjpboatrace import PyJPBoatrace  # v0.4.x を想定
 except Exception:
-    PyJPBoatrace = None  # Importに失敗した場合の保険
-
+    PyJPBoatrace = None
 
 _client_singleton: Optional["PyJPBoatrace"] = None
 
-
 def _client() -> "PyJPBoatrace":
-    """
-    PyJPBoatrace のシングルトン取得。未インポートなら例外。
-    """
     global _client_singleton
     if PyJPBoatrace is None:
-        raise RuntimeError("pyjpboatrace が利用できません。requirements のインストール/インポートをご確認ください。")
+        raise RuntimeError("pyjpboatrace が利用できません。requirements とインストール状況を確認してください。")
     if _client_singleton is None:
         _client_singleton = PyJPBoatrace()
     return _client_singleton
 
-
 def get_trio_odds(d: date, venue_id: int, rno: int) -> Tuple[Dict[TrioSet, float], Optional[str]]:
     """
-    三連複オッズを取得し、{ frozenset({a,b,c}): odds } に整形して返す。
+    三連複オッズ → {frozenset({a,b,c}): 倍率} に整形。
     返り値: (odds_map, update_tag)
-      - odds_map: 例 {frozenset({1,2,3}): 5.1, ...}
-      - update_tag: 例 '締切時オッズ' / '直前オッズ' など（取得できなければ None）
     """
     cli = _client()
-    raw = cli.get_odds_trio(d, venue_id, rno)  # 例: {'1=2=3': 5.1, 'date':..., 'update':...}
+    raw = cli.get_odds_trio(d, venue_id, rno)  # 例: {'1=2=3': 5.1, 'update': '締切時オッズ', ...}
     update = raw.get("update")
     odds: Dict[TrioSet, float] = {}
     for k, v in raw.items():
@@ -86,17 +71,15 @@ def get_trio_odds(d: date, venue_id: int, rno: int) -> Tuple[Dict[TrioSet, float
                 a, b, c = (int(x) for x in k.split("="))
                 odds[frozenset((a, b, c))] = float(v)
             except Exception:
-                # 不正キーは無視
                 continue
     return odds, update
 
-
 def get_trifecta_odds(d: date, venue_id: int, rno: int) -> Dict[Order3, float]:
     """
-    三連単オッズを取得し、{ (a,b,c): odds } に整形して返す。
+    三連単オッズ → {(a,b,c): 倍率} に整形。
     """
     cli = _client()
-    raw = cli.get_odds_trifecta(d, venue_id, rno)  # 例: {'1-2-3': 12.1, 'date':..., 'update':...}
+    raw = cli.get_odds_trifecta(d, venue_id, rno)  # 例: {'1-2-3': 12.1, 'update': '...'}
     odds: Dict[Order3, float] = {}
     for k, v in raw.items():
         if isinstance(k, str) and k.count("-") == 2:
@@ -107,19 +90,16 @@ def get_trifecta_odds(d: date, venue_id: int, rno: int) -> Dict[Order3, float]:
                 continue
     return odds
 
-
 def get_trifecta_result(d: date, venue_id: int, rno: int) -> Optional[Tuple[Order3, float]]:
     """
-    三連単の“結果”を取得して ((a,b,c), 倍率) を返す。
-    倍率は 100円あたりの払戻金を 100 で割ったもの。
-    （pyjpboatrace の返り値構造に合わせて安全にパース）
+    三連単の確定結果（((a,b,c), 倍率)）を取得。
+    倍率 = 100円あたり払戻金 / 100。
     """
     try:
         cli = _client()
         res = cli.get_race_result(d, venue_id, rno)
-        # 想定構造: {'payoff': {'trifecta': {'result': '1-5-3', 'payoff': 730}}, ...}
         payoff = res.get("payoff") or {}
-        tri = payoff.get("trifecta") or res.get("trifecta")  # 念のため両対応
+        tri = payoff.get("trifecta") or res.get("trifecta")
         if not tri:
             return None
         order_str = str(tri.get("result", "")).strip()
@@ -128,14 +108,13 @@ def get_trifecta_result(d: date, venue_id: int, rno: int) -> Optional[Tuple[Orde
         a, b, c = (int(x) for x in order_str.split("-"))
         payoff_yen = float(tri.get("payoff", 0.0))
         odds = payoff_yen / 100.0
-        return ( (a, b, c), odds )
+        return ((a, b, c), odds)
     except Exception:
         return None
 
-
 def get_just_before_info(d: date, venue_id: int, rno: int) -> Optional[dict]:
     """
-    直前情報（展示タイム・風・波など）を辞書で返す。取得できなければ None。
+    直前情報（展示タイム・風・波など）を辞書で返す。取得不可なら None。
     """
     try:
         cli = _client()
@@ -143,18 +122,17 @@ def get_just_before_info(d: date, venue_id: int, rno: int) -> Optional[dict]:
     except Exception:
         return None
 
-
-# ========== 三連複TopN → 確率化 ==========
+# ========= 3複TopN → 確率化 =========
 def normalize_probs_from_odds(
     trio_sorted_items: List[Tuple[TrioSet, float]],
     top_n: int = 10,
-    alpha: float = 1.0
+    alpha: float = 0.9,  # ← 既定を 0.9 に（従来は 1.0）
 ) -> Tuple[Dict[TrioSet, float], List[Tuple[TrioSet, float]]]:
     """
-    trio_sorted_items : (S, odds) の “オッズ昇順” リスト（外で sort してから渡す）
+    trio_sorted_items : (S, odds) の“オッズ昇順”リスト（外で sort 済み）
     返り値:
       - pmap_topN: {S: p}（TopNを 1/odds^α で正規化）
-      - items: TopNの (S, odds) リスト
+      - items    : TopNの (S, odds) リスト
     """
     items = trio_sorted_items[:top_n]
     weights: List[Tuple[TrioSet, float]] = []
@@ -167,20 +145,17 @@ def normalize_probs_from_odds(
     pmap = {S: (w / denom) for S, w in weights}
     return pmap, items
 
-
-# ========== 指標 ==========
+# ========= 指標 =========
 def top5_coverage(pmap: Dict[TrioSet, float]) -> float:
     vals = sorted(pmap.values(), reverse=True)[:5]
     return sum(vals)
 
-
 def inclusion_mass_for_boat(pmap: Dict[TrioSet, float], boat: int) -> float:
     return sum(p for S, p in pmap.items() if boat in S)
 
-
 def pair_mass(pmap: Dict[TrioSet, float]) -> Dict[Tuple[int, int], float]:
     """
-    3連複TopNの確率から、2艇コンビの“同舟券になりやすさ”を集計。
+    3複TopNの確率から、2艇コンビの“同舟券になりやすさ”を集計。
     """
     out = defaultdict(float)
     for S, p in pmap.items():
@@ -189,12 +164,10 @@ def pair_mass(pmap: Dict[TrioSet, float]) -> Dict[Tuple[int, int], float]:
             out[(i, j)] += p
     return out
 
-
-# ========== 三連複 → 三連単の順序分解 ==========
+# ========= 3複 → 3単 順序分解 =========
 def _perm_weights(order: Order3) -> float:
     i, j, k = order
     return HEAD_BIAS[i] * MID_BIAS[j] * TAIL_BIAS[k]
-
 
 def _split_to_orders(S: TrioSet, pS: float) -> List[Tuple[Order3, float]]:
     """
@@ -206,35 +179,33 @@ def _split_to_orders(S: TrioSet, pS: float) -> List[Tuple[Order3, float]]:
     z = sum(ws) or 1.0
     return [(perms[t], pS * ws[t] / z) for t in range(6)]
 
-
 def estimate_head_rate(pmap: Dict[TrioSet, float], head: int = 1) -> float:
     """
     “◯号艇が1着になる見込み”を、3複pから順序分解して推定。
     """
     acc = 0.0
     for S, pS in pmap.items():
-        if head not in S:
+        if head not in S:  # 含まれないセットは飛ばす
             continue
         for o, px in _split_to_orders(S, pS):
             if o[0] == head:
                 acc += px
     return acc
 
-
 def choose_R_by_coverage(pmap: Dict[TrioSet, float]) -> Tuple[int, str]:
     """
     レースの“固さ”から、採用する 3複セット数 R を大づかみに決定。
+    ※ 従来より +1（候補母集団を少し広げる）
     """
     cov5 = top5_coverage(pmap)
     if cov5 >= 0.75:
-        return 4, f"堅め（Top5={cov5:.1%}）"
+        return 5, f"堅め（Top5={cov5:.1%}）"
     elif cov5 >= 0.65:
-        return 5, f"やや本命（Top5={cov5:.1%}）"
+        return 6, f"やや本命（Top5={cov5:.1%}）"
     elif cov5 >= 0.55:
-        return 6, f"中庸（Top5={cov5:.1%}）"
+        return 7, f"中庸（Top5={cov5:.1%}）"
     else:
-        return 7, f"やや荒れ（Top5={cov5:.1%}）"
-
+        return 8, f"やや荒れ（Top5={cov5:.1%}）"
 
 def coverage_targets(pmap: Dict[TrioSet, float], targets=(0.25, 0.50, 0.75)):
     """
@@ -252,24 +223,21 @@ def coverage_targets(pmap: Dict[TrioSet, float], targets=(0.25, 0.50, 0.75)):
         out[t] = (k, items)
     return out
 
-
-# ========== 候補生成・補強 ==========
+# ========= 候補生成・補強 =========
 def build_trifecta_candidates(
     pmap: Dict[TrioSet, float],
     R: int,
-    avoid_top: bool = True,
+    avoid_top: bool = False,  # ← 既定を False（最有力も採用）
     max_per_set: int = 2
 ) -> List[Tuple[Order3, float, TrioSet]]:
     """
     上位Rセットから順序分解を行い、各セットごとに max_per_set 点を抽出。
-    avoid_top=True の場合、“最もありがちな順序”を各セットで1点だけスキップ。
     返り値: [(order, p_est, from_set), ...] を “当たりやすさ p_est” 降順で整列。
     """
     items = sorted(pmap.items(), key=lambda x: x[1], reverse=True)[:R]
     candidates: List[Tuple[Order3, float, TrioSet]] = []
 
     for S, pS in items:
-        # 6通りに分配し、重みの高い順に並べる（=ありがち順）
         perm = _split_to_orders(S, pS)
         perm_sorted = sorted(perm, key=lambda x: _perm_weights(x[0]), reverse=True)
 
@@ -277,7 +245,7 @@ def build_trifecta_candidates(
         skipped_once = False
         for (o, pe) in perm_sorted:
             if avoid_top and not skipped_once:
-                skipped_once = True  # 各セットで1回だけスキップ
+                skipped_once = True  # 古い動作互換用（avoid_top=Trueのときのみ1点スキップ）
                 continue
             picked.append((o, pe, S))
             if len(picked) >= max_per_set:
@@ -285,9 +253,7 @@ def build_trifecta_candidates(
 
         candidates.extend(picked)
 
-    # “当たりやすさ”が高い順に並べる（オッズは未考慮。EV判定は後段）
     return sorted(candidates, key=lambda x: x[1], reverse=True)
-
 
 def add_pair_hedge_if_needed(
     cands: List[Tuple[Order3, float, TrioSet]],
@@ -324,8 +290,7 @@ def add_pair_hedge_if_needed(
 
     return cands + extra
 
-
-# ========== 市場バイアス（“人気の集まり”） ==========
+# ========= 市場バイアス関連（“人気の集まり”） =========
 def head_market_rate(tri_odds: Dict[Order3, float], head: int = 1) -> float:
     """
     三連単オッズ全体から “iが頭になる市場確率” を概算（1/オッズで正規化）。
@@ -338,7 +303,6 @@ def head_market_rate(tri_odds: Dict[Order3, float], head: int = 1) -> float:
             if i == head:
                 mass += w
     return (mass / den) if den > 0 else 0.0
-
 
 def pair_overbet_ratio(
     pair: Tuple[int, int],
@@ -372,7 +336,6 @@ def pair_overbet_ratio(
     mkt = (mkt_mass / den) if den > 0 else 0.0
     exp = exp_mass * beta
     return (mkt / exp) if exp > 0 else float("inf")
-
 
 def value_ratios_for_pair(
     head: int, second: int,
@@ -412,21 +375,24 @@ def value_ratios_for_pair(
         out.append((k, ex, mk, ratio, odds))
     return out
 
-
-# ========== EV（割に合うか） & 資金配分 ==========
+# ========= EV（割に合うか） & 資金配分 =========
 def ev_of(order: Order3, p_est: float, tri_odds: Dict[Order3, float], margin: float):
     """
     EV（期待値）と“必要p”（=(1+margin)/odds）を計算して判定。
     返り値: (odds, req_p, ev, ok)
+    ※ 長配当（25倍以上）は margin を 2pp だけ軽減（過度な厳格で全落ちを防止）
     """
     odds = tri_odds.get(order)
     if (odds is None) or (odds <= 0):
         return (None, None, None, False)
-    req = (1.0 + margin) / odds
+    # 長穴の微救済（モデル誤差を吸収するための軽微な緩和）
+    m = margin
+    if odds >= 25.0:
+        m = max(0.0, margin - 0.02)
+    req = (1.0 + m) / odds
     ev = p_est * odds - 1.0
     ok = (p_est >= req)
     return (odds, req, ev, ok)
-
 
 def allocate_budget_by_prob(
     buys: List[Tuple[Order3, float, TrioSet]],
@@ -445,10 +411,10 @@ def allocate_budget_by_prob(
     if units <= 0:
         return [], 0
 
-    # 初期配分：p比率で四捨五入
+    # 初期配分：p比率で丸め
     raw = [(o, p, S, int(round((p / total_p) * units))) for (o, p, S) in buys]
 
-    # ゼロになったものは 1 単位に底上げ（後で全体調整）
+    # ゼロ配分は 1 単位に底上げ（のちに全体調整）
     for idx, (o, p, S, u) in enumerate(raw):
         if u <= 0:
             raw[idx] = (o, p, S, 1)
@@ -473,12 +439,11 @@ def allocate_budget_by_prob(
     used = sum(x[3] for x in out)
     return out, used
 
-
 def trim_candidates_with_rules(
     ok_rows: List[Tuple[Order3, float, TrioSet, float, float, float, bool]],
     max_points: int = 8,
     max_same_pair_points: int = 2,
-    add_margin_pp: int = 0  # 余裕%の追加は外で反映させる運用のため、ここでは未使用
+    add_margin_pp: int = 0
 ) -> List[Tuple[Order3, float, TrioSet, float, float, float, bool]]:
     """
     OK候補（EV達成）の中から、
