@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-core.py  —  “オッズだけで読む”競艇AIコア（全文）
+core.py  —  “オッズだけで読む”競艇AIコア（開催会場自動検出 付き・全文）
 
-この版の主なチューニング（当たりが付きにくい状況を改善）:
-  1) 3連複TopNの確率化の柔らかさ α を 0.9 に（既定値）
-     - 上位セットの重みをやや強調して、順序分解後の“当たりやすい列”を厚めに。
-  2) 3複→3単の候補生成で “最有力パターンの強制スキップ” を廃止（avoid_top=False）
-     - 本命1点を素直に候補へ含める（過熱対策はEV側で担保）。
-  3) EV判定に長穴（25倍以上）だけ 2pp の救済
-     - モデル誤差が大きい高配当帯で、過度に落ちるのを緩和。
-  4) “固さ”に応じた採用セット数Rを全体に+1（候補母集団を少し広げる）
+この版の主なポイント:
+  A) 開催会場だけを自動検出して日次バックテスト側で使えるようにするヘルパーを追加
+     - detect_active_venues(date) … その日「開催していそうな会場IDのリスト」を返す
+     - venues_on(date)            … detect_active_venues の別名（読みやすさ用）
+     - is_race_available(date, vid, rno) … レース単位の可用性チェック（内部で使用）
+     ※ 1R（→空なら6R）だけを軽く叩いて判断（全レース走査より劇的に高速）
 
-アプリ側（1レース診断/日次バックテスト）の I/F は互換です。
+  B) 予想ロジックのチューニング（“当たりが付きにくい”状況を緩和）
+     1) 3連複TopNの確率化 α=0.9（上位セットをやや重視）
+     2) 3複→3単の候補生成で最有力スキップを廃止（avoid_top=False）
+     3) EV判定で長配当（25倍以上）の margin を 2pp だけ軽減
+     4) “固さ”→R（採用セット数）を全体に +1（候補母集団を少し広げる）
+
+アプリ側（1レース診断/日次バックテスト）からの I/F は互換のままです。
 """
 
 from __future__ import annotations
@@ -19,9 +23,10 @@ from __future__ import annotations
 from typing import Dict, Tuple, List, Optional, Any
 from collections import defaultdict, Counter
 from datetime import date
+from functools import lru_cache
 
 # ========= 型 =========
-TrioSet = frozenset          # frozenset({a,b,c}) を3連複セットのキーに
+TrioSet = frozenset            # frozenset({a,b,c}) を3連複セットのキーに
 Order3 = Tuple[int, int, int]  # (i, j, k) = 3連単の順序タプル
 
 # ========= 会場マスタ =========
@@ -56,6 +61,7 @@ def _client() -> "PyJPBoatrace":
         _client_singleton = PyJPBoatrace()
     return _client_singleton
 
+# ========= 三連複/三連単/結果/直前 情報取得 =========
 def get_trio_odds(d: date, venue_id: int, rno: int) -> Tuple[Dict[TrioSet, float], Optional[str]]:
     """
     三連複オッズ → {frozenset({a,b,c}): 倍率} に整形。
@@ -121,6 +127,40 @@ def get_just_before_info(d: date, venue_id: int, rno: int) -> Optional[dict]:
         return cli.get_just_before_info(d, venue_id, rno)
     except Exception:
         return None
+
+# ========= 開催会場の自動検出（高速・軽量） =========
+@lru_cache(maxsize=128)
+def is_race_available(d: date, venue_id: int, rno: int = 1) -> bool:
+    """
+    指定日の場・レースに三連複オッズが存在するかを軽く確認。
+    1Rが空の場合は 6R を再チェックして True/False を返す。
+    """
+    try:
+        odds1, _ = get_trio_odds(d, venue_id, rno)
+        if odds1:
+            return True
+        # 1Rが空＝開催なし or 未公開の可能性。6Rも軽く見る。
+        odds6, _ = get_trio_odds(d, venue_id, 6)
+        return bool(odds6)
+    except Exception:
+        return False
+
+@lru_cache(maxsize=32)
+def detect_active_venues(d: date) -> List[int]:
+    """
+    指定日に“開催していそうな”会場IDのリストを返す。
+    1R（ダメなら6R）だけを見るので全レース走査より大幅に高速。
+    """
+    active: List[int] = []
+    for vid, _name in VENUES:
+        if is_race_available(d, vid, 1):
+            active.append(vid)
+    return active
+
+# 読みやすさのための別名
+def venues_on(d: date) -> List[int]:
+    """detect_active_venues のエイリアス。"""
+    return detect_active_venues(d)
 
 # ========= 3複TopN → 確率化 =========
 def normalize_probs_from_odds(
@@ -326,7 +366,7 @@ def pair_overbet_ratio(
 
     # 市場
     mkt_mass, den = 0.0, 0.0
-    for (a, b, c), o in tri_odds.items():
+    for (a, b, _c), o in tri_odds.items():
         if o and o > 0:
             w = 1.0 / o
             den += w
@@ -385,7 +425,6 @@ def ev_of(order: Order3, p_est: float, tri_odds: Dict[Order3, float], margin: fl
     odds = tri_odds.get(order)
     if (odds is None) or (odds <= 0):
         return (None, None, None, False)
-    # 長穴の微救済（モデル誤差を吸収するための軽微な緩和）
     m = margin
     if odds >= 25.0:
         m = max(0.0, margin - 0.02)
