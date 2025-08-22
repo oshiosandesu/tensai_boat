@@ -216,7 +216,7 @@ def submit_all_for_venue(v):
             futures.append(ex.submit(job))
         # 完了順に取り出し
         for fut in as_completed(futures):
-            nonlocal done
+            global done
             try:
                 rows.append(fut.result())
             except Exception as e:
