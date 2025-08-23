@@ -13,7 +13,7 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 
-from core import (
+from core_bridge import * 
     VENUES, VENUE_ID2NAME,
     get_trio_odds, get_trifecta_odds, get_just_before_info,
     normalize_probs_from_odds, top5_coverage, inclusion_mass_for_boat,
