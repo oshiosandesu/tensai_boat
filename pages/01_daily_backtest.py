@@ -18,7 +18,7 @@ import altair as alt
 
 # ---- core の取り込み（最新版に合わせる） ----
 try:
-    from core import (
+    from core_bridge import *
         VENUES, VENUE_ID2NAME,
         get_trio_odds, get_trifecta_odds, get_trifecta_result,
         normalize_probs_from_odds, build_trifecta_candidates, add_pair_hedge_if_needed,
