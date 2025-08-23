@@ -1,321 +1,196 @@
 # -*- coding: utf-8 -*-
 """
-pages/01_daily_backtest.py  ← 並列高速化版
-- 指定日・会場（単場 or 全場）で 1R〜12R を走査
-- ThreadPoolExecutor でレース並列取得（1〜6並列）
-- キャッシュ（10分）＋再試行（最大2回）＋エラーレートで並列数自動ダウン
-- 発注/見送り/未取得/エラーの理由を可視化
-- 明細CSV・累積損益グラフ
+pages/01_daily_backtest.py — 日次バックテスト
+- 当日開催場だけを回して ROI を集計
+- app.py と同じロジックで意思決定 → 実結果と突き合わせ
+- 並列なし（まずは正しさ重視）。必要なら ThreadPoolExecutor 化も容易。
 """
 
 from datetime import date
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
-import time
-import streamlit as st
 import pandas as pd
-import altair as alt
+import streamlit as st
 
-# ---- core の取り込み（最新版に合わせる） ----
-try:
-    from core_bridge import *
-        VENUES, VENUE_ID2NAME,
-        get_trio_odds, get_trifecta_odds, get_trifecta_result,
-        normalize_probs_from_odds, build_trifecta_candidates, add_pair_hedge_if_needed,
-        pair_mass, ev_of, allocate_budget_by_prob, choose_R_by_coverage,
-        trim_candidates_with_rules
-    )
-    _has_result_api = True
-except ImportError:
-    from core import (
-        VENUES, VENUE_ID2NAME,
-        get_trio_odds, get_trifecta_odds,
-        normalize_probs_from_odds, build_trifecta_candidates, add_pair_hedge_if_needed,
-        pair_mass, ev_of, allocate_budget_by_prob, choose_R_by_coverage,
-        trim_candidates_with_rules
-    )
-    get_trifecta_result = None
-    _has_result_api = False
+from core_bridge import (
+    VENUES, VENUE_ID2NAME, venues_on,
+    get_trio_odds, get_trifecta_odds, get_trifecta_result,
+    normalize_with_dynamic_alpha, top5_coverage, inclusion_mass_for_boat,
+    pair_mass, estimate_head_rate, choose_R_by_coverage,
+    build_trifecta_candidates, add_pair_hedge_if_needed,
+    market_head_rate, pair_overbet_ratio,
+    evaluate_candidates_with_overbet, trim_candidates_with_rules, allocate_budget_safely,
+)
 
-st.set_page_config(page_title="日次バックテスト（高速版）", page_icon="⚡", layout="wide")
-st.title("⚡ 日次バックテスト（高速版・並列取得）")
+# ===== ページ設定 =====
+st.set_page_config(page_title="日次バックテスト", page_icon="📊", layout="wide")
+st.title("📊 日次バックテスト（オッズベース）")
+st.caption("app.py と同じ判定ロジックで日単位のROIを検証します。")
 
-# ---------- サイドバー ----------
+# ===== サイドバー =====
 with st.sidebar:
     today = date.today()
     d = st.date_input("対象日", value=today, format="YYYY-MM-DD")
 
-    venue_names = [f"{vid:02d} - {name}" for vid, name in VENUES]
-    vsel = st.selectbox("開催場（まず単場でテスト推奨）", venue_names, index=len(VENUES)-1)
-    vid = int(vsel.split(" - ")[0])
-    vtitle = VENUE_ID2NAME.get(vid, f"場{vid}")
+    only_active = st.checkbox("開催会場のみを対象にする（推奨）", value=True)
+    venue_choices = [f"{vid:02d} - {name}" for vid, name in VENUES]
+    sel_all = st.multiselect("対象会場（空なら上の設定に従う）", venue_choices, default=[])
 
-    all_toggle = st.checkbox("全場を対象にする（通信負荷が高い）", value=False)
-
-    st.divider()
-    st.header("取得パフォーマンス")
-    max_workers = st.slider("会場内の並列数（レース単位）", min_value=1, max_value=6, value=3, step=1,
-                            help="Cloudでは2〜3推奨。専用サーバーなら4〜6も可。")
-    per_task_delay = st.slider("各タスク内の待機（秒）", min_value=0.00, max_value=0.50, value=0.05, step=0.05,
-                               help="公式側ブロック回避のため、各レース処理の頭で短いsleepを入れます。")
+    r_from = st.number_input("開始R", min_value=1, max_value=12, value=1, step=1)
+    r_to   = st.number_input("終了R", min_value=1, max_value=12, value=12, step=1)
 
     st.divider()
-    st.header("買い方パラメータ")
+    st.header("売買ルール（app.py と同一）")
     race_cap = st.number_input("1レース上限（円）", min_value=100, value=600, step=100)
     min_unit = st.number_input("最小購入単位（円）", min_value=100, value=100, step=100)
-    margin_pct = st.slider("余裕（%）", 0, 30, 10, 1)
+    margin_pct = st.slider("基本の余裕％", 0, 30, 10, 1)
     margin = margin_pct / 100.0
-    add_hedge = st.checkbox("保険を1点足す", value=True)
-    max_points = st.slider("点数上限（自動絞り）", 4, 12, 8, 1)
-    same_pair_max = st.slider("同一ペア上限（頭-2着）", 1, 3, 2, 1)
+    max_candidates = st.slider("候補の最大点数", 4, 10, 8, 1)
+    add_hedge = st.checkbox("保険（条件付きで1点追加）", value=True)
 
     st.divider()
-    relax = st.checkbox("絞り込み厳格化をオフ（+5ppを無効化）", value=False)
-    show_all_table = st.checkbox("発注なしのレースも明細に表示", value=True)
+    do_run = st.button("この条件で回す", type="primary", use_container_width=True)
 
-    do_run = st.button("この条件でバックテスト", type="primary", use_container_width=True)
-
-# ---------- キャッシュ ----------
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_trio(d_, vid_, rno_):
-    return get_trio_odds(d_, vid_, rno_)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_trifecta(d_, vid_, rno_):
-    return get_trifecta_odds(d_, vid_, rno_)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_result(d_, vid_, rno_):
-    if _has_result_api and get_trifecta_result is not None:
-        return get_trifecta_result(d_, vid_, rno_)
-    return None
-
-# ---------- 1レース処理（例外は外で拾う） ----------
-def process_one_race(d, vid, vname, rno,
-                     race_cap, min_unit, margin, add_hedge,
-                     max_points, same_pair_max, relax,
-                     per_task_delay):
-    """
-    1レース分の全処理。戻り値は rows 用の辞書1件。
-    内部で軽い待機を入れてブロック回避。
-    """
-    if per_task_delay > 0:
-        time.sleep(per_task_delay)
-
-    # 取得（キャッシュ活用）
-    trio_odds, _ = cached_trio(d, vid, rno)
-    tri_odds = cached_trifecta(d, vid, rno)
-
-    if not trio_odds or not tri_odds:
-        return {
-            "date": d.strftime("%Y%m%d"), "venue": vname, "venue_id": vid, "rno": rno,
-            "status": "no-odds", "reason": "オッズ未取得（未公開/休催/ブロック/エラー）",
-            "bet": 0, "payout": 0, "pnl": 0, "hit": 0, "n_points": 0, "mode": ""
-        }
-
-    # 確率化（Top10）→ R決定 → 候補生成
-    trio_sorted = sorted(trio_odds.items(), key=lambda x: x[1])
-    pmap_top10, _ = normalize_probs_from_odds(trio_sorted, top_n=10, alpha=1.0)
-    R, _ = choose_R_by_coverage(pmap_top10)
-    cands = build_trifecta_candidates(pmap_top10, R=R, avoid_top=True, max_per_set=2)
-
-    if add_hedge:
-        mass_pairs = pair_mass(pmap_top10)
-        top_pairs = sorted(mass_pairs.items(), key=lambda x: x[1], reverse=True)[:3]
-        cands = add_pair_hedge_if_needed(cands, pmap_top10, top_pairs, max_extra=1)
-
-    # EVチェック
-    ok_rows = []
-    for (o, p_est, S) in cands:
-        odds, req, ev, ok = ev_of(o, p_est, tri_odds, margin=margin)
-        if ok:
-            ok_rows.append((o, p_est, S, odds, req, ev, True))
-
-    # 点数絞り
-    trimmed = trim_candidates_with_rules(
-        ok_rows, max_points=max_points, max_same_pair_points=same_pair_max
-    )
-    # 候補多すぎ時の+5pp（厳格化）※relax=Trueなら無効
-    if (not relax) and len(trimmed) > max_points:
-        margin2 = min(0.30, margin + 0.05)
-        ok2 = []
-        for (o, p_est, S, *_ ) in ok_rows:
-            odds, req, ev, ok = ev_of(o, p_est, tri_odds, margin=margin2)
-            if ok:
-                ok2.append((o, p_est, S, odds, req, ev, True))
-        trimmed = trim_candidates_with_rules(ok2, max_points=max_points, max_same_pair_points=same_pair_max)
-
-    # 資金配分
-    buys_input = [(o, p, S) for (o, p, S, *_ ) in trimmed]
-    bets, used = allocate_budget_by_prob(buys_input, race_cap, min_unit=min_unit)
-    bet_map = {o: b for (o, p, S, b) in bets}
-
-    # 結果 or EVフォールバック
-    if used == 0:
-        return {
-            "date": d.strftime("%Y%m%d"), "venue": vname, "venue_id": vid, "rno": rno,
-            "status": "no-buy", "reason": "EV未達（割に合う買い目なし）",
-            "bet": 0, "payout": 0, "pnl": 0, "hit": 0, "n_points": 0, "mode": ""
-        }
-    else:
-        res = cached_result(d, vid, rno)
-        if res:
-            (win_order, win_odds) = res
-            hit_amt = bet_map.get(win_order, 0)
-            payout = int(round(hit_amt * tri_odds.get(win_order, win_odds)))
-            hit = 1 if hit_amt > 0 else 0
-            mode = "real"
-        else:
-            payout = 0
-            hit = 0
-            for (o, p, S, odds, req, ev, ok) in trimmed:
-                payout += int(round(bet_map.get(o, 0) * (p * tri_odds.get(o, odds))))
-            mode = "ev"
-        pnl = payout - used
-        return {
-            "date": d.strftime("%Y%m%d"), "venue": vname, "venue_id": vid, "rno": rno,
-            "status": "buy", "reason": "",
-            "bet": used, "payout": payout, "pnl": pnl, "hit": hit, "n_points": len(trimmed), "mode": mode
-        }
-
-# ---------- 実行 ----------
+# ===== 実行 =====
 if not do_run:
-    st.info("左の条件を設定して「この条件でバックテスト」を押してください。")
+    st.info("左の条件を設定して「この条件で回す」を押してください。")
     st.stop()
 
-venue_ids = [vid] if not all_toggle else [x for x, _ in VENUES]
-total_jobs = len(venue_ids) * 12
-progress = st.progress(0.0)
-
-rows = []
-errors = []
-done = 0
-
-def submit_all_for_venue(v):
-    vname = VENUE_ID2NAME.get(v, f"場{v}")
-    futures = []
-    # 同一会場の1〜12Rを並列化
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for rno in range(1, 13):
-            # 各レースは軽く再試行（最大2回）して返す
-            def job(d=d, vid=v, vname=vname, r=rno):
-                last_err = None
-                for _try in range(2):
-                    try:
-                        return process_one_race(
-                            d, vid, vname, r,
-                            race_cap, min_unit, margin, add_hedge,
-                            max_points, same_pair_max, relax,
-                            per_task_delay
-                        )
-                    except Exception as e:
-                        last_err = e
-                        time.sleep(0.2)
-                # 再試行2回失敗
-                raise last_err
-            futures.append(ex.submit(job))
-        # 完了順に取り出し
-        for fut in as_completed(futures):
-            global done
-            try:
-                rows.append(fut.result())
-            except Exception as e:
-                errors.append(str(e)[:200])
-                rows.append({
-                    "date": d.strftime("%Y%m%d"), "venue": vname, "venue_id": v, "rno": None,
-                    "status": "error", "reason": f"{e}", "bet": 0, "payout": 0, "pnl": 0, "hit": 0, "n_points": 0, "mode": ""
-                })
-            finally:
-                done += 1
-                progress.progress(done / total_jobs)
-
-# 会場ごとに処理（会場間は直列、会場内は並列）
-for v in venue_ids:
-    st.markdown(f"### {d.strftime('%Y-%m-%d')}　{VENUE_ID2NAME.get(v, f'場{v}')}　1〜12R")
-    submit_all_for_venue(v)
-
-# ---------- 集計・可視化 ----------
-df = pd.DataFrame(rows)
-
-# サマリーバッジ
-n_total = len(df)
-n_no_odds = int((df["status"] == "no-odds").sum())
-n_no_buy = int((df["status"] == "no-buy").sum())
-n_error = int((df["status"] == "error").sum())
-n_buy = int((df["status"] == "buy").sum())
-st.markdown(
-    f"**処理サマリ**　"
-    f"発注あり: **{n_buy}**　/　"
-    f"見送り(EV未達): **{n_no_buy}**　/　"
-    f"オッズ未取得: **{n_no_odds}**　/　"
-    f"エラー: **{n_error}**　/　"
-    f"合計: **{n_total}**"
-)
-
-# エラーレートが高い場合のヒント
-if n_error + n_no_odds > 0 and total_jobs > 0:
-    bad_rate = (n_error + n_no_odds) / total_jobs
-    if bad_rate >= 0.25:
-        st.warning("取得エラー/未取得が多いです。並列数を下げる（例: 1〜2）か、各タスク待機を増やしてください。")
-        # 並列自動ダウンの提案
-        if max_workers > 1:
-            st.info("ヒント：このページを2枚開き、片方は単場×並列1、もう片方は別場×並列1で走らせると安定しやすいです。")
-
-# 発注あり（集計）
-df_buy = df[df["status"] == "buy"].copy()
-if not df_buy.empty:
-    df_buy["cum_pnl"] = df_buy["pnl"].cumsum()
-    total_bet = int(df_buy["bet"].sum())
-    total_payout = int(df_buy["payout"].sum())
-    total_pnl = int(df_buy["pnl"].sum())
-    hits = int(df_buy["hit"].sum())
-    n = int(len(df_buy))
-    roi = (total_payout / total_bet) if total_bet > 0 else 0.0
-
-    st.subheader(f"集計（{('全場' if all_toggle else vtitle)} / {d.strftime('%Y-%m-%d')}）")
-    left, right = st.columns(2)
-    with left:
-        st.metric("総投下", f"{total_bet} 円")
-        st.metric("総払戻", f"{total_payout} 円")
-        st.metric("損益", f"{total_pnl:+,} 円")
-    with right:
-        st.metric("的中数（実結果ベース）", f"{hits} / {n}")
-        st.metric("ROI", f"{roi:.2f}")
-
-    st.subheader("累積損益")
-    chart = alt.Chart(df_buy).mark_line().encode(
-        x=alt.X("rno:Q", title="R（通し）"),
-        y=alt.Y("cum_pnl:Q", title="累積損益（円）"),
-        tooltip=["venue","rno","bet","payout","pnl","cum_pnl","mode"]
-    ).properties(height=280)
-    st.altair_chart(chart, use_container_width=True)
-
-    st.subheader("明細（発注あり）")
-    st.dataframe(
-        df_buy[["venue","rno","n_points","bet","payout","pnl","hit","mode"]],
-        use_container_width=True
-    )
-    st.download_button(
-        "明細（発注あり）を保存（CSV）",
-        df_buy.to_csv(index=False).encode("utf-8"),
-        file_name=f"bt_buy_{d.strftime('%Y%m%d')}_{'ALL' if all_toggle else vtitle}.csv",
-        mime="text/csv"
-    )
+# 対象会場の決定
+if sel_all:
+    target_vids = [int(x.split(" - ")[0]) for x in sel_all]
 else:
-    st.warning("この条件では『発注あり』のレースがありませんでした。余裕%を下げる/点数上限を増やす/保険ONなどをお試しください。")
+    target_vids = venues_on(d) if only_active else [vid for vid, _ in VENUES]
 
-# 発注なし（診断目的の一覧）
-if show_all_table:
-    df_nobuy = df[df["status"].isin(["no-buy", "no-odds", "error"])].copy()
-    if not df_nobuy.empty:
-        st.subheader("明細（発注なし）")
-        st.dataframe(
-            df_nobuy[["venue","rno","status","reason"]],
-            use_container_width=True
-        )
-        st.download_button(
-            "明細（発注なし）を保存（CSV）",
-            df_nobuy.to_csv(index=False).encode("utf-8"),
-            file_name=f"bt_nobuy_{d.strftime('%Y%m%d')}_{'ALL' if all_toggle else vtitle}.csv",
-            mime="text/csv"
-        )
+if not target_vids:
+    st.warning("対象会場が見つかりません。日付や開催可否の判定を確認してください。")
+    st.stop()
+
+st.write(f"対象日: **{d.strftime('%Y-%m-%d')}** / 対象会場: {len(target_vids)} / R: {r_from}〜{r_to}")
+
+# 集計バッファ
+rows = []
+total_bet = 0
+total_return = 0
+
+prog = st.progress(0)
+done = 0
+total_tasks = len(target_vids) * max(0, r_to - r_from + 1)
+
+for vid in target_vids:
+    vname = VENUE_ID2NAME.get(vid, f"場{vid}")
+    for rno in range(r_from, r_to + 1):
+        done += 1
+        prog.progress(min(1.0, done / max(1, total_tasks)))
+
+        try:
+            trio_odds, update_tag = get_trio_odds(d, vid, rno)
+            if not trio_odds:
+                continue
+            trifecta_odds = get_trifecta_odds(d, vid, rno)
+            if not trifecta_odds:
+                continue
+
+            # 確率化（動的α）
+            trio_sorted = sorted(trio_odds.items(), key=lambda x: x[1])
+            pmap_top10, top10_items, alpha_used, cov5_preview = normalize_with_dynamic_alpha(trio_sorted, top_n=10)
+
+            # 指標
+            cov5 = top5_coverage(pmap_top10)
+            inc1 = inclusion_mass_for_boat(pmap_top10, 1)
+            head1_est = estimate_head_rate(pmap_top10, head=1)
+            head1_mkt = market_head_rate(trifecta_odds, head=1)
+            mass_pairs = pair_mass(pmap_top10)
+            top_pairs = sorted(mass_pairs.items(), key=lambda x: x[1], reverse=True)[:3]
+            R, _label_cov = choose_R_by_coverage(pmap_top10)
+
+            # 候補生成（プレビュー用は省略し、本番候補のみ作成）
+            base_cands = build_trifecta_candidates(pmap_top10, R=R, avoid_top=True, max_per_set=2, cov5_hint=cov5)
+
+            # 条件付きヘッジ（堅くて過熱気味の時だけ）
+            primary_pair = top_pairs[0][0] if top_pairs else (1, 2)
+            over_ratio = pair_overbet_ratio(primary_pair, pmap_top10, trifecta_odds)
+            if add_hedge and (cov5 >= 0.68 and over_ratio >= 1.12):
+                base_cands = add_pair_hedge_if_needed(base_cands, pmap_top10, top_pairs, max_extra=1)
+
+            # 判定（過熱課金・帯で余裕%出し分け・スリッページ）
+            judged = evaluate_candidates_with_overbet(
+                base_cands, pmap_top10, trifecta_odds, base_margin=margin,
+                overbet_thresh=1.30, overbet_cut=1.50, overbet_extra=0.03,
+                long_odds_extra=0.10, short_odds_relax=0.00,
+                long_odds_threshold=25.0, short_odds_threshold=12.0,
+                max_odds=60.0, slippage=0.07
+            )
+
+            # トリミング
+            trimmed = trim_candidates_with_rules(judged, max_points=max_candidates, max_same_pair_points=2)
+
+            # 多すぎる場合、余裕+5pp で再判定
+            if len(trimmed) > max_candidates:
+                judged2 = evaluate_candidates_with_overbet(
+                    base_cands, pmap_top10, trifecta_odds, base_margin=min(0.30, margin + 0.05),
+                    overbet_thresh=1.30, overbet_cut=1.50, overbet_extra=0.03,
+                    long_odds_extra=0.10, short_odds_relax=0.00,
+                    long_odds_threshold=25.0, short_odds_threshold=12.0,
+                    max_odds=60.0, slippage=0.07
+                )
+                trimmed = trim_candidates_with_rules(judged2, max_points=max_candidates, max_same_pair_points=2)
+
+            # 配分（半ケリー＋上限）
+            bets, used = allocate_budget_safely(trimmed, race_cap, min_unit=min_unit, per_bet_cap_ratio=0.40)
+            used_amt = sum(b for (_o, _p, _S, b, _od) in bets)
+
+            # 結果取得
+            res = get_trifecta_result(d, vid, rno)
+            hit = False
+            ret_amt = 0
+            if res:
+                (win_o, win_odds) = res
+                # 的中金額 = (当該並びの購入額 / 100) * 払戻金額（= 100×オッズ）
+                # ここでは “購入額 × オッズ” として評価（100円単位の扱いは各自の約定仕様に依存）
+                for (o, p, S, bet_yen, od_eval) in bets:
+                    if o == win_o:
+                        hit = True
+                        ret_amt += int(round(bet_yen * win_odds))
+            total_bet += used_amt
+            total_return += ret_amt
+
+            rows.append({
+                "date": d.strftime("%Y%m%d"),
+                "venue_id": vid, "venue": vname, "rno": rno,
+                "cov5": cov5, "inc1": inc1, "head1_est": head1_est, "head1_mkt": head1_mkt,
+                "alpha_used": alpha_used,
+                "n_bets": len(bets), "bet_total": used_amt, "return_total": ret_amt,
+                "hit": hit
+            })
+
+        except Exception as e:
+            rows.append({
+                "date": d.strftime("%Y%m%d"),
+                "venue_id": vid, "venue": vname, "rno": rno,
+                "error": str(e)
+            })
+            continue
+
+# ===== 結果表示 =====
+df = pd.DataFrame(rows)
+if df.empty:
+    st.warning("結果が空でした。対象日のデータ有無をご確認ください。")
+    st.stop()
+
+c1, c2, c3 = st.columns(3)
+bet_sum = int(df["bet_total"].fillna(0).sum())
+ret_sum = int(df["return_total"].fillna(0).sum())
+roi = (ret_sum / bet_sum) if bet_sum > 0 else 0.0
+hit_rate = (df["hit"].fillna(False).mean()) if "hit" in df else 0.0
+
+c1.metric("総購入", f"{bet_sum:,} 円")
+c2.metric("総払戻", f"{ret_sum:,} 円")
+c3.metric("ROI", f"{roi:.2f} 倍")
+
+st.metric("的中率（レース単位）", f"{hit_rate:.1%}")
+
+st.subheader("レース別サマリ")
+show_cols = ["date", "venue", "rno", "n_bets", "bet_total", "return_total", "hit", "cov5", "head1_mkt", "head1_est", "alpha_used"]
+st.dataframe(df[show_cols].sort_values(["venue", "rno"]).reset_index(drop=True), use_container_width=True)
+
+st.subheader("ダウンロード")
+st.download_button("全明細（CSV）", df.to_csv(index=False).encode("utf-8"), file_name=f"daily_backtest_{d.strftime('%Y%m%d')}.csv", mime="text/csv")
