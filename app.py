@@ -6,6 +6,13 @@ app.py
 - 点数絞り（6〜8点）・同一ペア最大2点・候補多すぎ時の余裕%引き締め
 - “割に合うものだけ”で最終出力（core.py の新ロジックに完全準拠）
 """
+# --- ここを app.py の import より前に差し込む ---
+import sys, os
+from pathlib import Path
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+# -----------------------------------------------
 
 from datetime import date
 import json
