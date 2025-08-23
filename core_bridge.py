@@ -1,28 +1,47 @@
 # -*- coding: utf-8 -*-
 """
-core_bridge.py — import 互換レイヤー（衝突に強い版）
-- まず 'core' を試し、無ければ 'boatcore' を読む
-- 見つかったコアから必要関数を re-export
-- 無い関数はフォールバックで補う
+core_bridge.py — “絶対読める”版
+- モジュール名依存の import をやめ、app と同階層の core.py（or boatcore.py）をファイル直読み
+- これにより sys.path/名前衝突を完全回避
+- 読み込み時エラーの内容を握りつぶさず、分かる範囲で文字列化して再送出
 """
 from __future__ import annotations
-from importlib import import_module
+import sys
+from pathlib import Path
+import importlib.util
+import types
 
-# ---- どのコアを使うか決定（core.py 優先。無ければ boatcore.py） ----
+BASE_DIR = Path(__file__).resolve().parent
+CANDIDATES = [BASE_DIR / "core.py", BASE_DIR / "boatcore.py"]
+
+_loaded = None
 _last_err = None
-C = None
-for modname in ("core", "boatcore"):
+
+for path in CANDIDATES:
+    if not path.exists():
+        continue
     try:
-        C = import_module(modname)
-        CORE_MODULE_NAME = modname
+        modname = f"_boatcore_{path.stem}"
+        spec = importlib.util.spec_from_file_location(modname, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"spec/loader is None for {path}")
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[modname] = m  # 再読み込み・相互参照回避
+        spec.loader.exec_module(m)
+        _loaded = m
+        CORE_FILE = str(path)
         break
     except Exception as e:
         _last_err = e
-if C is None:
+
+if _loaded is None:
     raise ImportError(
-        "Neither 'core.py' nor 'boatcore.py' could be imported. "
-        "Place one of them next to app.py. Last error: %r" % _last_err
+        "core_bridge: failed to load core. "
+        f"Tried: {', '.join(str(p) for p in CANDIDATES)}. "
+        f"Last error: {repr(_last_err)}"
     )
+
+C: types.ModuleType = _loaded  # 以降は C をコアとして扱う
 
 def _has(name: str) -> bool:
     return hasattr(C, name)
@@ -33,6 +52,7 @@ def _get(name: str):
 def _export(name: str, obj):
     globals()[name] = obj
 
+# ここに並べた名前を re-export（core 側にあれば生かす）
 BASIC_EXPORTS = [
     # 取得系
     "get_trio_odds", "get_trifecta_odds", "get_trifecta_result", "get_just_before_info",
@@ -59,7 +79,7 @@ for n in BASIC_EXPORTS:
     if _has(n):
         _export(n, _get(n))
 
-# --------- フォールバック実装（無い時だけ定義） ----------
+# ---------- フォールバック群（core に無い場合のみ定義） ----------
 if not _has("normalize_with_dynamic_alpha") and _has("normalize_probs_from_odds") and _has("top5_coverage"):
     def _choose_alpha_by_cov5(cov5: float) -> float:
         if cov5 >= 0.75: return 1.20
@@ -162,3 +182,6 @@ if not _has("allocate_budget_safely"):
         out = [(o, p, S, u * min_unit, od) for (o, p, S, od, u) in prelim if u > 0]
         used = sum(x[3] for x in out); return out, used
     _export("allocate_budget_safely", allocate_budget_safely)
+
+# デバッグ用にどの core を読んだか見られるようにエクスポート
+_loaded_core_file = CORE_FILE
