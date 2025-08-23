@@ -1,21 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-core.py  —  “オッズだけで読む”競艇AIコア（開催会場自動検出 付き・全文）
+copy.py  —  “オッズだけで読む”競艇AIコア（市場の歪み=過大/過小評価の可視化 版・全文）
 
-この版の主なポイント:
-  A) 開催会場だけを自動検出して日次バックテスト側で使えるようにするヘルパーを追加
-     - detect_active_venues(date) … その日「開催していそうな会場IDのリスト」を返す
-     - venues_on(date)            … detect_active_venues の別名（読みやすさ用）
-     - is_race_available(date, vid, rno) … レース単位の可用性チェック（内部で使用）
-     ※ 1R（→空なら6R）だけを軽く叩いて判断（全レース走査より劇的に高速）
+このファイルは、現行の core.py を置き換え/併用できるように設計。
+主なポイント（ROI重視のチューニングを網羅）:
 
-  B) 予想ロジックのチューニング（“当たりが付きにくい”状況を緩和）
-     1) 3連複TopNの確率化 α=0.9（上位セットをやや重視）
-     2) 3複→3単の候補生成で最有力スキップを廃止（avoid_top=False）
-     3) EV判定で長配当（25倍以上）の margin を 2pp だけ軽減
-     4) “固さ”→R（採用セット数）を全体に +1（候補母集団を少し広げる）
+  A) 開催会場の自動検出
+     - venues_on(date): その日に“開催していそうな”会場IDを返す（高速）
 
-アプリ側（1レース診断/日次バックテスト）からの I/F は互換のままです。
+  B) 三連複TopN → 確率化 → 三連単順序分解
+     - α（1/odds^α）の “自動選択”（堅いほどα↑）
+     - 内枠・中/外枠の軽い順序バイアス（HEAD/MID/TAIL）
+
+  C) 市場の確率（q）とモデルの確率（p）の比較
+     - 三連単ごとの割安スコア: VR_tri = p(o) / q(o)
+     - (頭,2着)ペアの過熱度: Over_pair = 市場/期待
+     - 1着の過熱度（頭率）: Over_head = 市場/期待
+
+  D) EV（期待値）判定を “オッズ帯で出し分け”
+     - 短配当（<12）: 緩めない/やや厳しめ
+     - 中配当（12–25）: 主戦場（余裕+6〜10%）
+     - 長配当（25–60）: さらに厳しめ（+8〜12%）
+     - 超長配当（>60）: 原則不採用
+     - 過熱ペアは “課金” （余裕+3%）で自然に落とす
+     - スリッページ（約定オッズ低下）を見込んだEV判定（例：-7%）
+
+  E) レース入口フィルター（まず地雷を踏まない）
+     - Top5カバレッジ帯で選別
+     - 1号艇の市場頭率レンジで選別
+     - 過熱ペアしきい値（>1.4）で除外
+
+  F) 点数上限・ペア上限・資金配分
+     - 総点数上限（例：6–8点）
+     - 同一(頭,2着)ペア上限（例：2点）
+     - 半ケリー + 1点あたり上限 + 総上限
+
+依存:
+  - Python 3.9+
+  - pyjpboatrace (オッズ/結果/直前データの取得)
 """
 
 from __future__ import annotations
@@ -24,6 +46,7 @@ from typing import Dict, Tuple, List, Optional, Any
 from collections import defaultdict, Counter
 from datetime import date
 from functools import lru_cache
+import math
 
 # ========= 型 =========
 TrioSet = frozenset            # frozenset({a,b,c}) を3連複セットのキーに
@@ -61,7 +84,7 @@ def _client() -> "PyJPBoatrace":
         _client_singleton = PyJPBoatrace()
     return _client_singleton
 
-# ========= 三連複/三連単/結果/直前 情報取得 =========
+# ========= オッズ/結果/直前 =========
 def get_trio_odds(d: date, venue_id: int, rno: int) -> Tuple[Dict[TrioSet, float], Optional[str]]:
     """
     三連複オッズ → {frozenset({a,b,c}): 倍率} に整形。
@@ -128,7 +151,7 @@ def get_just_before_info(d: date, venue_id: int, rno: int) -> Optional[dict]:
     except Exception:
         return None
 
-# ========= 開催会場の自動検出（高速・軽量） =========
+# ========= 開催会場の自動検出（高速） =========
 @lru_cache(maxsize=128)
 def is_race_available(d: date, venue_id: int, rno: int = 1) -> bool:
     """
@@ -139,17 +162,15 @@ def is_race_available(d: date, venue_id: int, rno: int = 1) -> bool:
         odds1, _ = get_trio_odds(d, venue_id, rno)
         if odds1:
             return True
-        # 1Rが空＝開催なし or 未公開の可能性。6Rも軽く見る。
         odds6, _ = get_trio_odds(d, venue_id, 6)
         return bool(odds6)
     except Exception:
         return False
 
 @lru_cache(maxsize=32)
-def detect_active_venues(d: date) -> List[int]:
+def venues_on(d: date) -> List[int]:
     """
-    指定日に“開催していそうな”会場IDのリストを返す。
-    1R（ダメなら6R）だけを見るので全レース走査より大幅に高速。
+    指定日に開催していそうな会場IDのリスト。
     """
     active: List[int] = []
     for vid, _name in VENUES:
@@ -157,16 +178,22 @@ def detect_active_venues(d: date) -> List[int]:
             active.append(vid)
     return active
 
-# 読みやすさのための別名
-def venues_on(d: date) -> List[int]:
-    """detect_active_venues のエイリアス。"""
-    return detect_active_venues(d)
-
 # ========= 3複TopN → 確率化 =========
+def _choose_alpha_by_cov5(cov5: float) -> float:
+    # 固いほど α を大きく（上位強調）→ ヒット率寄り
+    if cov5 >= 0.75:
+        return 1.20
+    elif cov5 >= 0.65:
+        return 1.10
+    elif cov5 >= 0.55:
+        return 1.00
+    else:
+        return 0.90
+
 def normalize_probs_from_odds(
     trio_sorted_items: List[Tuple[TrioSet, float]],
     top_n: int = 10,
-    alpha: float = 0.9,  # ← 既定を 0.9 に（従来は 1.0）
+    alpha: float = 0.9,
 ) -> Tuple[Dict[TrioSet, float], List[Tuple[TrioSet, float]]]:
     """
     trio_sorted_items : (S, odds) の“オッズ昇順”リスト（外で sort 済み）
@@ -184,6 +211,22 @@ def normalize_probs_from_odds(
     denom = sum(w for _, w in weights) or 1.0
     pmap = {S: (w / denom) for S, w in weights}
     return pmap, items
+
+def normalize_with_dynamic_alpha(
+    trio_sorted_items: List[Tuple[TrioSet, float]],
+    top_n: int = 10
+) -> Tuple[Dict[TrioSet, float], List[Tuple[TrioSet, float]], float, float]:
+    """
+    trio_sorted_items: (S, odds) のオッズ昇順リスト
+    返り値: (pmap, items, alpha_used, cov5_preview)
+      - cov5_preview: まず α=1.0 で概算した Top5カバレッジ
+      - alpha_used  : cov5_preview に応じて選んだ α
+    """
+    base, items = normalize_probs_from_odds(trio_sorted_items, top_n=top_n, alpha=1.0)
+    cov5_preview = top5_coverage(base)
+    alpha = _choose_alpha_by_cov5(cov5_preview)
+    pmap, items = normalize_probs_from_odds(trio_sorted_items, top_n=top_n, alpha=alpha)
+    return pmap, items, alpha, cov5_preview
 
 # ========= 指標 =========
 def top5_coverage(pmap: Dict[TrioSet, float]) -> float:
@@ -225,17 +268,110 @@ def estimate_head_rate(pmap: Dict[TrioSet, float], head: int = 1) -> float:
     """
     acc = 0.0
     for S, pS in pmap.items():
-        if head not in S:  # 含まれないセットは飛ばす
+        if head not in S:
             continue
         for o, px in _split_to_orders(S, pS):
             if o[0] == head:
                 acc += px
     return acc
 
+# ========= “市場の確率” q（正規化された 1/odds） =========
+def market_prob_trifecta(tri_odds: Dict[Order3, float]) -> Dict[Order3, float]:
+    """
+    三連単の市場確率 q(o) を作る（1/odds を全体正規化）。
+    """
+    w = {}
+    s = 0.0
+    for o, odds in tri_odds.items():
+        if odds and odds > 0:
+            r = 1.0 / odds
+            w[o] = r
+            s += r
+    if s <= 0:
+        return {o: 0.0 for o in tri_odds.keys()}
+    return {o: (x / s) for o, x in w.items()}
+
+def market_head_rate(tri_odds: Dict[Order3, float], head: int) -> float:
+    q = market_prob_trifecta(tri_odds)
+    return sum(q.get((head, j, k), 0.0) for j in range(1, 7) for k in range(1, 7) if j != head and k not in (head, j))
+
+def market_pair_rate(tri_odds: Dict[Order3, float], i: int, j: int) -> float:
+    q = market_prob_trifecta(tri_odds)
+    s = 0.0
+    for k in range(1, 7):
+        if k in (i, j): 
+            continue
+        s += q.get((i, j, k), 0.0)
+        s += q.get((j, i, k), 0.0)
+    return s
+
+# ========= “モデルの確率” p（3複→順序分解） =========
+def model_prob_trifecta(pmap: Dict[TrioSet, float]) -> Dict[Order3, float]:
+    """
+    3複セット確率 pmap から三連単確率 p(o) を生成。
+    """
+    out = defaultdict(float)
+    for S, pS in pmap.items():
+        for o, px in _split_to_orders(S, pS):
+            out[o] += px
+    return dict(out)
+
+def model_head_rate(pmap: Dict[TrioSet, float], head: int) -> float:
+    ptri = model_prob_trifecta(pmap)
+    return sum(ptri.get((head, j, k), 0.0) for j in range(1, 7) for k in range(1, 7) if j != head and k not in (head, j))
+
+def model_pair_rate(pmap: Dict[TrioSet, float], i: int, j: int) -> float:
+    ptri = model_prob_trifecta(pmap)
+    s = 0.0
+    for k in range(1, 7):
+        if k in (i, j): 
+            continue
+        s += ptri.get((i, j, k), 0.0)
+        s += ptri.get((j, i, k), 0.0)
+    return s
+
+# ========= 歪みの指標（割安/過熱） =========
+def value_ratio_tri(p_tri: Dict[Order3, float], q_tri: Dict[Order3, float]) -> Dict[Order3, float]:
+    """
+    並びごとの割安スコア VR = p(o)/q(o) を返す（q(o)=0は +inf）。
+    """
+    out = {}
+    for o, p in p_tri.items():
+        q = q_tri.get(o, 0.0)
+        if q <= 0:
+            out[o] = float("inf") if p > 0 else 1.0
+        else:
+            out[o] = p / q
+    return out
+
+def pair_overbet_ratio(pair: Tuple[int, int], pmap: Dict[TrioSet, float], tri_odds: Dict[Order3, float]) -> float:
+    """
+    (頭,2着) ペアの過熱度 = 市場/期待。
+    """
+    i, j = pair
+    # 期待（モデル）
+    exp_mass = 0.0
+    for S, pS in pmap.items():
+        if i in S and j in S:
+            for (o, px) in _split_to_orders(S, pS):
+                if (o[0], o[1]) in ((i, j), (j, i)):
+                    exp_mass += px
+    # 市場
+    mkt = market_pair_rate(tri_odds, i, j)
+    return (mkt / exp_mass) if exp_mass > 0 else float("inf")
+
+def head_overbet_ratio(head: int, pmap: Dict[TrioSet, float], tri_odds: Dict[Order3, float]) -> float:
+    """
+    1着の過熱度 = 市場/期待。
+    """
+    p_head = model_head_rate(pmap, head)
+    q_head = market_head_rate(tri_odds, head)
+    return (q_head / p_head) if p_head > 0 else float("inf")
+
+# ========= 採用セット数 R（固さによる粗い制御） =========
 def choose_R_by_coverage(pmap: Dict[TrioSet, float]) -> Tuple[int, str]:
     """
-    レースの“固さ”から、採用する 3複セット数 R を大づかみに決定。
-    ※ 従来より +1（候補母集団を少し広げる）
+    レースの“固さ”から、採用する 3複セット数 R を決定（候補母集団を少し広げ気味）。
     """
     cov5 = top5_coverage(pmap)
     if cov5 >= 0.75:
@@ -247,33 +383,27 @@ def choose_R_by_coverage(pmap: Dict[TrioSet, float]) -> Tuple[int, str]:
     else:
         return 8, f"やや荒れ（Top5={cov5:.1%}）"
 
-def coverage_targets(pmap: Dict[TrioSet, float], targets=(0.25, 0.50, 0.75)):
-    """
-    “上位から積んだとき、どこまでで t% に到達するか”を返す。
-    """
-    items = sorted(pmap.items(), key=lambda x: x[1], reverse=True)
-    out = {}
-    for t in targets:
-        acc, k = 0.0, 0
-        for i, (S, p) in enumerate(items, start=1):
-            acc += p
-            if acc >= t:
-                k = i
-                break
-        out[t] = (k, items)
-    return out
-
-# ========= 候補生成・補強 =========
+# ========= 候補生成 =========
 def build_trifecta_candidates(
     pmap: Dict[TrioSet, float],
     R: int,
-    avoid_top: bool = False,  # ← 既定を False（最有力も採用）
-    max_per_set: int = 2
+    avoid_top: bool = False,          # 最有力も採用（本命を素直に残す）
+    max_per_set: Optional[int] = None,
+    cov5_hint: Optional[float] = None,
 ) -> List[Tuple[Order3, float, TrioSet]]:
     """
     上位Rセットから順序分解を行い、各セットごとに max_per_set 点を抽出。
-    返り値: [(order, p_est, from_set), ...] を “当たりやすさ p_est” 降順で整列。
+    cov5_hint があれば:
+      - cov5 >= 0.75 → 3点/セット
+      - それ以外      → 2点/セット
+    返り値: [(order, p_est, from_set), ...] を “当たりやすさ p_est” 降順。
     """
+    if max_per_set is None:
+        if (cov5_hint is not None) and (cov5_hint >= 0.75):
+            max_per_set = 3
+        else:
+            max_per_set = 2
+
     items = sorted(pmap.items(), key=lambda x: x[1], reverse=True)[:R]
     candidates: List[Tuple[Order3, float, TrioSet]] = []
 
@@ -285,7 +415,7 @@ def build_trifecta_candidates(
         skipped_once = False
         for (o, pe) in perm_sorted:
             if avoid_top and not skipped_once:
-                skipped_once = True  # 古い動作互換用（avoid_top=Trueのときのみ1点スキップ）
+                skipped_once = True
                 continue
             picked.append((o, pe, S))
             if len(picked) >= max_per_set:
@@ -330,53 +460,257 @@ def add_pair_hedge_if_needed(
 
     return cands + extra
 
-# ========= 市場バイアス関連（“人気の集まり”） =========
-def head_market_rate(tri_odds: Dict[Order3, float], head: int = 1) -> float:
+# ========= EV（期待値）判定・オッズ帯出し分け・過熱課金・スリッページ =========
+def adjust_for_slippage(odds: float, slip_rate: float = 0.07) -> float:
     """
-    三連単オッズ全体から “iが頭になる市場確率” を概算（1/オッズで正規化）。
+    スリッページ（約定時にオッズが悪化する想定）を反映。
+    例: slip_rate=0.07 なら、表示オッズ×(1-0.07) で評価。
     """
-    mass, den = 0.0, 0.0
-    for (i, j, k), o in tri_odds.items():
-        if o and o > 0:
-            w = 1.0 / o
-            den += w
-            if i == head:
-                mass += w
-    return (mass / den) if den > 0 else 0.0
+    if odds is None:
+        return None
+    return max(1.0, odds * (1.0 - max(0.0, slip_rate)))
 
-def pair_overbet_ratio(
-    pair: Tuple[int, int],
+def ev_of_band(
+    order: Order3,
+    p_est: float,
+    tri_odds: Dict[Order3, float],
+    base_margin: float,
+    *,
+    long_odds_extra: float = 0.10,     # 25–60倍は +10% 程度を推奨
+    short_odds_relax: float = -0.00,   # <12倍は緩めない（0〜+2%を推奨なら正に）
+    long_odds_threshold: float = 25.0,
+    short_odds_threshold: float = 12.0,
+    max_odds: float = 60.0,            # >60倍は原則不採用
+    slippage: float = 0.07,            # スリッページ率
+    extra_margin: float = 0.0          # 過熱ペアなどの課金加算
+) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
+    """
+    オッズ帯によって余裕%を出し分けし、スリッページを反映したEV判定を行う。
+    返り値: (odds_adj, req_p, ev, ok)
+    """
+    odds = tri_odds.get(order)
+    if (odds is None) or (odds <= 0):
+        return (None, None, None, False)
+    if odds > max_odds:
+        return (odds, None, None, False)
+
+    # スリッページを反映した評価用オッズ
+    odds_eval = adjust_for_slippage(odds, slippage)
+
+    # 余裕%の出し分け
+    m = base_margin + extra_margin
+    if odds_eval < short_odds_threshold:
+        m = max(0.0, base_margin + short_odds_relax + extra_margin)
+    elif odds_eval >= long_odds_threshold:
+        m = base_margin + long_odds_extra + extra_margin
+
+    req = (1.0 + m) / odds_eval
+    ev = p_est * odds_eval - 1.0
+    ok = (p_est >= req)
+    return (odds_eval, req, ev, ok)
+
+def evaluate_candidates_with_overbet(
+    cands: List[Tuple[Order3, float, TrioSet]],
     pmap: Dict[TrioSet, float],
     tri_odds: Dict[Order3, float],
-    beta: float = 1.0
-) -> float:
+    base_margin: float,
+    *,
+    overbet_thresh: float = 1.30,
+    overbet_cut: float = 1.50,
+    overbet_extra: float = 0.03,
+    long_odds_extra: float = 0.10,
+    short_odds_relax: float = 0.00,
+    long_odds_threshold: float = 25.0,
+    short_odds_threshold: float = 12.0,
+    max_odds: float = 60.0,
+    slippage: float = 0.07
+) -> List[Tuple[Order3, float, TrioSet, float, float, float, bool, float]]:
     """
-    “モデル期待”に対する“市場の過熱度”（市場/期待）を、頭-2着ペアで推定。
-    1.0 より大きいほど“買われすぎ”の傾向。
+    候補ごとに EV 判定を行う。過熱ペアには余裕+α を上乗せ、超過熱は切る。
+    返り値: [(order, p_est, from_set, odds_eval, req, ev, ok, over_ratio)]
     """
-    i, j = pair
+    out = []
+    cache_over = {}
+    for (o, p_est, S) in cands:
+        pair = (o[0], o[1])
+        if pair not in cache_over:
+            cache_over[pair] = pair_overbet_ratio(pair, pmap, tri_odds)
+        over = cache_over[pair]
 
-    # 期待（モデル）
-    exp_mass = 0.0
-    for S, pS in pmap.items():
-        if i in S and j in S:
-            for (o, px) in _split_to_orders(S, pS):
-                if (o[0], o[1]) in ((i, j), (j, i)):
-                    exp_mass += px
+        # 超過熱は切る
+        if over >= overbet_cut:
+            out.append((o, p_est, S, tri_odds.get(o, None), None, None, False, over))
+            continue
 
-    # 市場
-    mkt_mass, den = 0.0, 0.0
-    for (a, b, _c), o in tri_odds.items():
-        if o and o > 0:
-            w = 1.0 / o
-            den += w
-            if (a, b) in ((i, j), (j, i)):
-                mkt_mass += w
+        # しきい値以上は課金
+        extra = overbet_extra if over >= overbet_thresh else 0.0
 
-    mkt = (mkt_mass / den) if den > 0 else 0.0
-    exp = exp_mass * beta
-    return (mkt / exp) if exp > 0 else float("inf")
+        odds_eval, req, ev, ok = ev_of_band(
+            o, p_est, tri_odds, base_margin,
+            long_odds_extra=long_odds_extra,
+            short_odds_relax=short_odds_relax,
+            long_odds_threshold=long_odds_threshold,
+            short_odds_threshold=short_odds_threshold,
+            max_odds=max_odds,
+            slippage=slippage,
+            extra_margin=extra
+        )
+        out.append((o, p_est, S, odds_eval, req, ev, ok, over))
+    return out
 
+# ========= トリミング（点数上限/ペア上限） =========
+def trim_candidates_with_rules(
+    rows: List[Tuple[Order3, float, TrioSet, float, float, float, bool, float]],
+    max_points: int = 8,
+    max_same_pair_points: int = 2
+) -> List[Tuple[Order3, float, TrioSet, float, float, float, bool, float]]:
+    """
+    EV達成（ok=True）の中から、
+      - EV降順（同点なら 期待リターン p*odds）で優先
+      - 同一 (頭,2着) ペアは最大 max_same_pair_points まで
+      - 上から max_points まで
+    """
+    ok_rows = [r for r in rows if r[6] is True and (r[3] is not None)]
+    ok_rows_sorted = sorted(ok_rows, key=lambda x: (x[5], x[1] * (x[3] or 0.0)), reverse=True)
+
+    pair_count = Counter()
+    trimmed: List[Tuple[Order3, float, TrioSet, float, float, float, bool, float]] = []
+    for row in ok_rows_sorted:
+        o = row[0]
+        pair = (o[0], o[1])
+        if pair_count[pair] >= max_same_pair_points:
+            continue
+        trimmed.append(row)
+        pair_count[pair] += 1
+        if len(trimmed) >= max_points:
+            break
+    return trimmed
+
+# ========= 資金配分（半ケリー + 上限リミッター） =========
+def half_kelly_bet_fraction(p_est: float, odds_eval: float) -> float:
+    """
+    ケリー基準の 1/2。p*(b) - (1-p) / b を 1/2 に縮小。
+    ここで b = odds-1。負値は 0 に丸め。
+    """
+    if (odds_eval is None) or (odds_eval <= 1.0):
+        return 0.0
+    b = odds_eval - 1.0
+    f = (p_est - (1.0 - p_est) / b)
+    return max(0.0, 0.5 * f)
+
+def allocate_budget_safely(
+    buys: List[Tuple[Order3, float, TrioSet, float, float, float, bool, float]],
+    race_cap: int,
+    min_unit: int = 100,
+    per_bet_cap_ratio: float = 0.40  # 1点あたり上限（総上限の40%など）
+) -> Tuple[List[Tuple[Order3, float, TrioSet, int, float]], int]:
+    """
+    半ケリーに基づいて“望ましい額”を出し、最小刻みに丸め、かつ各点に上限をかけて配分。
+    返り値: [(order, p_est, from_set, bet_yen, odds_eval)], used_total
+    """
+    if race_cap <= 0 or not buys:
+        return [], 0
+
+    # 各点の理想額（半ケリー × race_cap）を計算
+    wish = []
+    for (o, p_est, S, odds_eval, req, ev, ok, over) in buys:
+        f = half_kelly_bet_fraction(p_est, odds_eval)
+        amt = f * race_cap
+        wish.append((o, p_est, S, odds_eval, amt))
+
+    # 全額が小さすぎる場合に備えて比率再配分（ゼロが多発すると配れないため）
+    total_wish = sum(max(0.0, x[4]) for x in wish)
+    if total_wish <= 0:
+        # すべて同額で1単位ずつ配る（最低限）
+        units = race_cap // min_unit
+        if units <= 0:
+            return [], 0
+        unit_each = max(1, units // len(wish))
+        out = []
+        used_units = 0
+        for (o, p, S, odds_eval, _) in wish:
+            out.append((o, p, S, unit_each * min_unit, odds_eval))
+            used_units += unit_each
+            if used_units >= units:
+                break
+        used = sum(x[3] for x in out)
+        return out, used
+
+    # 各点の上限
+    per_cap = race_cap * per_bet_cap_ratio
+
+    # 希望額に基づいて丸め＋上限適用
+    prelim = []
+    for (o, p, S, odds_eval, amt) in wish:
+        amt = min(amt, per_cap)
+        units = int(round(amt / min_unit))
+        prelim.append((o, p, S, odds_eval, units))
+
+    # 合計ユニットを race_cap に合わせる
+    target_units = race_cap // min_unit
+    cur_units = sum(u for *_, u in prelim)
+    # 足りない/超過を調整
+    if cur_units == 0:
+        # 最低限1単位ずつ配る
+        prelim = [(o, p, S, od, 1) for (o, p, S, od, u) in prelim]
+        cur_units = len(prelim)
+    while cur_units > target_units and prelim:
+        # pが小さいものから削る
+        idx = min(range(len(prelim)), key=lambda i: prelim[i][1] if prelim[i][4] > 0 else 1e9)
+        o, p, S, od, u = prelim[idx]
+        if u > 0:
+            prelim[idx] = (o, p, S, od, u - 1)
+            cur_units -= 1
+        else:
+            break
+    while cur_units < target_units:
+        # pが大きいものに足す（ただし per_cap を超えないように）
+        idx = max(range(len(prelim)), key=lambda i: prelim[i][1])
+        o, p, S, od, u = prelim[idx]
+        prelim[idx] = (o, p, S, od, u + 1)
+        cur_units += 1
+
+    out = [(o, p, S, u * min_unit, od) for (o, p, S, od, u) in prelim if u > 0]
+    used = sum(x[3] for x in out)
+    return out, used
+
+# ========= レース入口フィルター（地雷回避） =========
+def should_skip_race_by_entry_filters(
+    pmap_top10: Dict[TrioSet, float],
+    tri_odds: Dict[Order3, float],
+    *,
+    cov5_min: float = 0.55,
+    cov5_max: float = 0.75,
+    head1_min: float = 0.25,
+    head1_max: float = 0.38,
+    over_pair_drop: float = 1.40
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    レースを“最初から回さない”判断。True=見送り。
+      - Top5カバレッジが極端すぎる（>0.85 or <0.45）を避ける前に、まず狙い目帯に限定
+      - 1号艇の市場頭率が高すぎ/低すぎるレースを避ける
+      - 過熱ペアが極端に強いレースを避ける
+    """
+    cov5 = top5_coverage(pmap_top10)
+    if not (cov5_min <= cov5 <= cov5_max):
+        return True, {"reason": "cov5_out", "cov5": cov5}
+
+    # 1号艇の市場頭率
+    q_head1 = market_head_rate(tri_odds, 1)
+    if not (head1_min <= q_head1 <= head1_max):
+        return True, {"reason": "head1_out", "q_head1": q_head1, "cov5": cov5}
+
+    # 過熱ペアのチェック（上位ペア3つ程度）
+    p_pairs = pair_mass(pmap_top10)
+    top_pairs = sorted(p_pairs.items(), key=lambda x: x[1], reverse=True)[:3]
+    for (i, j), _mass in top_pairs:
+        over = pair_overbet_ratio((i, j), pmap_top10, tri_odds)
+        if over >= over_pair_drop:
+            return True, {"reason": "overpair_out", "pair": (i, j), "over": over, "cov5": cov5}
+
+    return False, {"cov5": cov5, "q_head1": q_head1}
+
+# ========= 3着の妙味ヒント =========
 def value_ratios_for_pair(
     head: int, second: int,
     pmap: Dict[TrioSet, float],
@@ -395,14 +729,13 @@ def value_ratios_for_pair(
                     exp[o[2]] += px
 
     # 市場人気
+    q = market_prob_trifecta(tri_odds)
     mkt = defaultdict(float)
     den = 0.0
-    for (i, j, k), o in tri_odds.items():
-        if o and o > 0:
-            w = 1.0 / o
-            den += w
-            if i == head and j == second:
-                mkt[k] += w
+    for (i, j, k), qq in q.items():
+        den += qq
+        if i == head and j == second:
+            mkt[k] += qq
     for k in list(mkt.keys()):
         mkt[k] = (mkt[k] / den) if den > 0 else 0.0
 
@@ -414,95 +747,3 @@ def value_ratios_for_pair(
         ratio = (mk / ex) if ex > 0 else float("inf")
         out.append((k, ex, mk, ratio, odds))
     return out
-
-# ========= EV（割に合うか） & 資金配分 =========
-def ev_of(order: Order3, p_est: float, tri_odds: Dict[Order3, float], margin: float):
-    """
-    EV（期待値）と“必要p”（=(1+margin)/odds）を計算して判定。
-    返り値: (odds, req_p, ev, ok)
-    ※ 長配当（25倍以上）は margin を 2pp だけ軽減（過度な厳格で全落ちを防止）
-    """
-    odds = tri_odds.get(order)
-    if (odds is None) or (odds <= 0):
-        return (None, None, None, False)
-    m = margin
-    if odds >= 25.0:
-        m = max(0.0, margin - 0.02)
-    req = (1.0 + m) / odds
-    ev = p_est * odds - 1.0
-    ok = (p_est >= req)
-    return (odds, req, ev, ok)
-
-def allocate_budget_by_prob(
-    buys: List[Tuple[Order3, float, TrioSet]],
-    race_cap: int,
-    min_unit: int = 100
-) -> Tuple[List[Tuple[Order3, float, TrioSet, int]], int]:
-    """
-    “確率按分”で race_cap を min_unit 刻みに配分。
-    返り値: [(order, p_est, from_set, bet_yen)], used_total
-    """
-    if race_cap <= 0 or not buys:
-        return [], 0
-
-    total_p = sum(p for _, p, _ in buys) or 1.0
-    units = race_cap // min_unit
-    if units <= 0:
-        return [], 0
-
-    # 初期配分：p比率で丸め
-    raw = [(o, p, S, int(round((p / total_p) * units))) for (o, p, S) in buys]
-
-    # ゼロ配分は 1 単位に底上げ（のちに全体調整）
-    for idx, (o, p, S, u) in enumerate(raw):
-        if u <= 0:
-            raw[idx] = (o, p, S, 1)
-
-    # 合計ユニットを合わせる（最小pから削る／最大pに足す）
-    cur = sum(u for *_, u in raw)
-    while cur > units:
-        mi = min(range(len(raw)), key=lambda i: raw[i][1] if raw[i][3] > 0 else 1e9)
-        o, p, S, u = raw[mi]
-        if u > 0:
-            raw[mi] = (o, p, S, u - 1)
-            cur -= 1
-        else:
-            break
-    while cur < units:
-        ma = max(range(len(raw)), key=lambda i: raw[i][1])
-        o, p, S, u = raw[ma]
-        raw[ma] = (o, p, S, u + 1)
-        cur += 1
-
-    out = [(o, p, S, u * min_unit) for (o, p, S, u) in raw if u > 0]
-    used = sum(x[3] for x in out)
-    return out, used
-
-def trim_candidates_with_rules(
-    ok_rows: List[Tuple[Order3, float, TrioSet, float, float, float, bool]],
-    max_points: int = 8,
-    max_same_pair_points: int = 2,
-    add_margin_pp: int = 0
-) -> List[Tuple[Order3, float, TrioSet, float, float, float, bool]]:
-    """
-    OK候補（EV達成）の中から、
-      - EV降順（同点なら期待リターン p*odds）で優先
-      - 同一 (頭,2着) ペアは最大 max_same_pair_points まで
-      - 上から max_points まで
-    を満たすように絞り込む。
-    """
-    # EV降順 → 期待リターン（p*odds）降順の安定ソート
-    ok_rows_sorted = sorted(ok_rows, key=lambda x: (x[5], x[1] * (x[3] or 0.0)), reverse=True)
-
-    pair_count = Counter()
-    trimmed: List[Tuple[Order3, float, TrioSet, float, float, float, bool]] = []
-    for row in ok_rows_sorted:
-        o, p_est, S, odds, req, ev, ok = row
-        pair = (o[0], o[1])
-        if pair_count[pair] >= max_same_pair_points:
-            continue
-        trimmed.append(row)
-        pair_count[pair] += 1
-        if len(trimmed) >= max_points:
-            break
-    return trimmed
