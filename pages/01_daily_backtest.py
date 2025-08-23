@@ -5,6 +5,13 @@ pages/01_daily_backtest.py — 日次バックテスト
 - app.py と同じロジックで意思決定 → 実結果と突き合わせ
 - 並列なし（まずは正しさ重視）。必要なら ThreadPoolExecutor 化も容易。
 """
+# --- ここを pages/01_daily_backtest.py の import より前に差し込む ---
+import sys
+from pathlib import Path
+APP_DIR = Path(__file__).resolve().parents[1]   # pages の 1 つ上 = app.py の場所
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+# --------------------------------------------------------------------
 
 from datetime import date
 import pandas as pd
