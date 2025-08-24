@@ -1,6 +1,6 @@
 # core.py
-# 天才ボートくん：オッズ解析コア
-# - 3連複/3連単オッズ取得（pyjpboatraceラッパー＋フェイルセーフ）
+# 天才ボートくん：オッズ解析コア（完全版）
+# - 3連複/3連単オッズ取得（pyjpboatraceラッパー＋LIVE/SIM可視化）
 # - 3複→3単分解（順序バイアス・レーン別重み）
 # - 市場確率 q とモデル確率 p、ブレンド確率 p*（遊びモード）
 # - EVモード（勝ち向け）の候補抽出・配分
@@ -11,17 +11,25 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import itertools
 import math
-import time
 import random
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
 # ---- pyjpboatrace の有無を確認（無い時はデモフェイルセーフに切替） ----
 try:
     import pyjpboatrace as pjb  # 実環境で利用
 except Exception:
     pjb = None
+
+# ---- 直近取得のメタ情報（UI表示用） ----
+LAST_SOURCE_3T: str = "unknown"
+LAST_SOURCE_3F: str = "unknown"
+LAST_ERR_3T: str = ""
+LAST_ERR_3F: str = ""
+LAST_COUNT_3T: int = 0
+LAST_COUNT_3F: int = 0
 
 
 # ===== ボートレース場マスタ =====
@@ -158,7 +166,7 @@ def _entropy(probs: np.ndarray) -> float:
     return float(-np.sum(p * np.log(p)))
 
 
-# ===== pyjpboatrace ラッパ（あいまいAPIに対応／失敗時はデモ用乱数） =====
+# ===== デモ用シミュレーション生成 =====
 def _simulate_odds_trifecta() -> Dict[Tuple[int, int, int], float]:
     # ランダムディリクレ分布→確率→オッズ生成（デモ用）
     probs = np.random.dirichlet(alpha=np.ones(len(PERMS_3T)) * 1.2)
@@ -173,38 +181,39 @@ def _simulate_odds_trio() -> Dict[Tuple[int, int, int], float]:
     return {comb: max(1.01, coef / float(probs[i])) for i, comb in enumerate(COMBS_3F)}
 
 
+# ===== pyjpboatrace ラッパ（LIVE/SIM 可視化つき） =====
 def get_trifecta_odds(date: str, venue_id: int, race_no: int, allow_sim_fallback: bool = True) -> Dict[Tuple[int, int, int], float]:
     """
     3連単オッズ取得。辞書 {(a,b,c): odds} を返す。
+    取得ソースや件数・エラーはモジュール変数に格納（UIで表示するため）。
     """
-    # 実API（pyjpboatrace）の試行
+    global LAST_SOURCE_3T, LAST_ERR_3T, LAST_COUNT_3T
+    LAST_SOURCE_3T, LAST_ERR_3T, LAST_COUNT_3T = "unknown", "", 0
+
+    # 実API（pyjpboatrace）
     if pjb is not None:
         try:
-            # 代表的な呼び出しパターンを試行（パッケージ版差異を吸収）
-            # 例：pyjpboatrace.get_trifecta_odds(date, jcd, race_no) のようなもの
-            # 下記は仮API。実環境の関数名に合わせて使われます（try/except で吸収）
+            data = None
             if hasattr(pjb, "get_trifecta_odds"):
                 data = pjb.get_trifecta_odds(date=date, jcd=venue_id, rno=race_no)
+                src = "live:get_trifecta_odds"
             elif hasattr(pjb, "OfficialAPI"):
                 api = pjb.OfficialAPI()
                 data = api.odds_trifecta(date=date, jcd=venue_id, rno=race_no)
+                src = "live:OfficialAPI.odds_trifecta"
             else:
-                data = None
+                data, src = None, "live:unknown_api"
 
-            odds_map = {}
+            odds_map: Dict[Tuple[int, int, int], float] = {}
             if data:
-                # data の形に応じて解釈（例：list[dict] or dict）
-                if isinstance(data, dict):
-                    iterator = data.items()
-                else:
-                    iterator = data
-
+                iterator = data.items() if isinstance(data, dict) else data
                 for row in iterator:
-                    # 代表的フィールド名を総当たり
                     if isinstance(row, tuple) and len(row) == 2 and isinstance(row[0], tuple):
                         comb, odds = row
                         comb = tuple(int(x) for x in comb)
-                        odds_map[comb] = _safe_float(odds, None)
+                        val = _safe_float(odds, None)
+                        if val:
+                            odds_map[comb] = val
                     elif isinstance(row, dict):
                         a = int(row.get("first") or row.get("a") or row.get("i") or 0)
                         b = int(row.get("second") or row.get("b") or row.get("j") or 0)
@@ -212,42 +221,55 @@ def get_trifecta_odds(date: str, venue_id: int, race_no: int, allow_sim_fallback
                         o = _safe_float(row.get("odds") or row.get("value") or row.get("o"), None)
                         if a and b and c and o:
                             odds_map[(a, b, c)] = o
-                if odds_map:
-                    return odds_map
-        except Exception:
-            pass
+            if odds_map:
+                LAST_SOURCE_3T, LAST_COUNT_3T = src, len(odds_map)
+                return odds_map
+            else:
+                LAST_ERR_3T = f"no_data_from_api({src})"
+        except Exception as e:
+            LAST_ERR_3T = f"api_error:{type(e).__name__}:{e}"
 
-    # フォールバック（デモ）
+    # フォールバック
     if allow_sim_fallback:
-        return _simulate_odds_trifecta()
-    return {}
+        sim = _simulate_odds_trifecta()
+        LAST_SOURCE_3T, LAST_COUNT_3T = "sim", len(sim)
+        return sim
+    else:
+        LAST_SOURCE_3T = "none"
+        return {}
 
 
 def get_trio_odds(date: str, venue_id: int, race_no: int, allow_sim_fallback: bool = True) -> Dict[Tuple[int, int, int], float]:
     """
-    3連複オッズ取得。辞書 {(i,j,k): odds}（i<j<k）を返す。
+    3連複オッズ取得。辞書 {(i,j,k): odds}（i<j<k）
+    取得ソースや件数・エラーはモジュール変数に格納（UIで表示するため）。
     """
+    global LAST_SOURCE_3F, LAST_ERR_3F, LAST_COUNT_3F
+    LAST_SOURCE_3F, LAST_ERR_3F, LAST_COUNT_3F = "unknown", "", 0
+
     if pjb is not None:
         try:
+            data = None
             if hasattr(pjb, "get_trio_odds"):
                 data = pjb.get_trio_odds(date=date, jcd=venue_id, rno=race_no)
+                src = "live:get_trio_odds"
             elif hasattr(pjb, "OfficialAPI"):
                 api = pjb.OfficialAPI()
                 data = api.odds_trio(date=date, jcd=venue_id, rno=race_no)
+                src = "live:OfficialAPI.odds_trio"
             else:
-                data = None
+                data, src = None, "live:unknown_api"
 
-            odds_map = {}
+            odds_map: Dict[Tuple[int, int, int], float] = {}
             if data:
-                if isinstance(data, dict):
-                    iterator = data.items()
-                else:
-                    iterator = data
+                iterator = data.items() if isinstance(data, dict) else data
                 for row in iterator:
                     if isinstance(row, tuple) and len(row) == 2 and isinstance(row[0], tuple):
                         comb, odds = row
                         comb = tuple(sorted(int(x) for x in comb))
-                        odds_map[comb] = _safe_float(odds, None)
+                        val = _safe_float(odds, None)
+                        if val:
+                            odds_map[comb] = val
                     elif isinstance(row, dict):
                         a = int(row.get("first") or row.get("a") or row.get("i") or 0)
                         b = int(row.get("second") or row.get("b") or row.get("j") or 0)
@@ -256,14 +278,21 @@ def get_trio_odds(date: str, venue_id: int, race_no: int, allow_sim_fallback: bo
                         o = _safe_float(row.get("odds") or row.get("value") or row.get("o"), None)
                         if all(tup) and o:
                             odds_map[tup] = o
-                if odds_map:
-                    return odds_map
-        except Exception:
-            pass
+            if odds_map:
+                LAST_SOURCE_3F, LAST_COUNT_3F = src, len(odds_map)
+                return odds_map
+            else:
+                LAST_ERR_3F = f"no_data_from_api({src})"
+        except Exception as e:
+            LAST_ERR_3F = f"api_error:{type(e).__name__}:{e}"
 
     if allow_sim_fallback:
-        return _simulate_odds_trio()
-    return {}
+        sim = _simulate_odds_trio()
+        LAST_SOURCE_3F, LAST_COUNT_3F = "sim", len(sim)
+        return sim
+    else:
+        LAST_SOURCE_3F = "none"
+        return {}
 
 
 def get_race_context(date: str, venue_id: int, race_no: int) -> Dict:
@@ -294,7 +323,6 @@ def get_entries(date: str, venue_id: int, race_no: int) -> Dict[int, Runner]:
     runners: Dict[int, Runner] = {i: Runner(lane=i) for i in range(1, 7)}
     if pjb is not None:
         try:
-            # 仮API（実環境依存）
             data = None
             if hasattr(pjb, "get_entries"):
                 data = pjb.get_entries(date=date, jcd=venue_id, rno=race_no)
@@ -303,7 +331,6 @@ def get_entries(date: str, venue_id: int, race_no: int) -> Dict[int, Runner]:
                 data = api.entries(date=date, jcd=venue_id, rno=race_no)
 
             if data:
-                # dataが list[dict] を想定。無ければ安全にスキップ
                 for row in data:
                     lane = int(row.get("lane") or row.get("w") or 0)
                     if lane in runners:
@@ -326,7 +353,6 @@ def get_entries(date: str, venue_id: int, race_no: int) -> Dict[int, Runner]:
                         r.exhibit_time = _safe_float(row.get("exhibit_time") or row.get("ex"), None)
                         r.tilt = _safe_float(row.get("tilt"), None)
                         r.parts_change = str(row.get("parts_change") or "")
-                        # 直近走
                         rr = row.get("recent_results")
                         if isinstance(rr, list):
                             r.recent_results = rr
@@ -335,27 +361,28 @@ def get_entries(date: str, venue_id: int, race_no: int) -> Dict[int, Runner]:
     return runners
 
 
-# ===== スナップショット作成 =====
-def fetch_snapshot(date: str, venue_id: int, race_no: int) -> Snapshot:
-    odds3t = get_trifecta_odds(date, venue_id, race_no, allow_sim_fallback=True)
-    odds3f = get_trio_odds(date, venue_id, race_no, allow_sim_fallback=True)
+# ===== スナップショット作成（allow_sim_fallback で挙動切替可） =====
+def fetch_snapshot(date: str, venue_id: int, race_no: int, allow_sim_fallback: bool = True) -> Snapshot:
+    """
+    スナップショット作成。allow_sim_fallback=False にすると、
+    実オッズ取得に失敗した場合は空を返す（UIで“取得失敗”を検出しやすくする）。
+    """
+    odds3t = get_trifecta_odds(date, venue_id, race_no, allow_sim_fallback=allow_sim_fallback)
+    odds3f = get_trio_odds(date, venue_id, race_no, allow_sim_fallback=allow_sim_fallback)
     info = get_race_context(date, venue_id, race_no)
     entries = get_entries(date, venue_id, race_no)
 
-    # 市場確率 q（3単）からエントロピー、ブック合算などを計算
+    # 市場確率 q（3単）からエントロピー、ブック合算（未正規化 ∑1/odds）などを計算
     q_vec = []
     for perm in PERMS_3T:
         o = odds3t.get(perm)
-        if o and o > 0:
-            q_vec.append(1.0 / o)
-        else:
-            q_vec.append(0.0)
-    q_vec = np.array(q_vec)
+        q_vec.append(1.0 / o if (o and o > 0) else 0.0)
+    q_vec = np.array(q_vec, dtype=float)
     q_norm = _normalize_weights(q_vec)
     entropy_3t = _entropy(q_norm)
-    book_sum = float(np.sum(q_norm))  # 正規化後は1.0になるが、未正規化合算も別途出せる
+    book_sum_raw = float(np.sum(q_vec)) if q_vec.size else None  # 未正規化合算
 
-    # 3複Top5カバレッジ（alpha=1で一旦計算、UIで表示）
+    # 3複Top5カバレッジ（α=1で一旦計算）
     if odds3f:
         inv = np.array([1.0 / max(1.0e-9, odds3f[c]) for c in COMBS_3F])
         p3f = _normalize_weights(inv)
@@ -368,16 +395,21 @@ def fetch_snapshot(date: str, venue_id: int, race_no: int) -> Snapshot:
         venue_id=venue_id,
         race_no=race_no,
         taken_at=datetime.now(),
-        weather={
-            "raw": info or {},
-        },
+        weather={"raw": info or {}},
         entries=entries,
         odds_trio=[TrioOdds(c, float(odds3f[c])) for c in odds3f.keys()],
         odds_trifecta=[TrifectaOdds(c, float(odds3t[c])) for c in odds3t.keys()],
         meta={
             "entropy_3t": entropy_3t,
-            "book_sum": float(np.sum(1.0 / np.maximum(1.0e-9, q_vec))) if len(q_vec) else None,  # 未正規合算
+            "book_sum": book_sum_raw,
             "coverage_top5_3f": top5,
+            # 取得メタ（UI表示用）
+            "source_3t": LAST_SOURCE_3T,
+            "source_3f": LAST_SOURCE_3F,
+            "count_3t": LAST_COUNT_3T,
+            "count_3f": LAST_COUNT_3F,
+            "error_3t": LAST_ERR_3T,
+            "error_3f": LAST_ERR_3F,
         },
     )
     return snap
@@ -435,6 +467,21 @@ def decompose_trio_to_trifecta(p3f: Dict[Tuple[int, int, int], float],
     return p3t
 
 
+def aggregate_to_trio(prob3t: Dict[Tuple[int, int, int], float]) -> Dict[Tuple[int, int, int], float]:
+    """
+    3単確率から 3複（順序無視）へ集約。
+    """
+    out = {c: 0.0 for c in COMBS_3F}
+    for (a, b, c), val in prob3t.items():
+        comb = tuple(sorted((a, b, c)))
+        out[comb] += float(val)
+    s = sum(out.values())
+    if s > 0:
+        for k in out:
+            out[k] /= s
+    return out
+
+
 def build_probabilities(snapshot: Snapshot, params: ModelParams) -> Dict[str, Dict[Tuple[int, int, int], float]]:
     """
     p（モデル：3複→3単分解）、q（市場：3単オッズ）、p*（遊び向けブレンド）を作る。
@@ -448,13 +495,13 @@ def build_probabilities(snapshot: Snapshot, params: ModelParams) -> Dict[str, Di
     )
     q3t = normalize_trifecta(snapshot.odds_trifecta)
     # 遊び向けブレンド
-    pstar = {}
+    pstar3t = {}
     w = float(params.blend_w)
     for perm in PERMS_3T:
         p = p3t.get(perm, 0.0)
         q = q3t.get(perm, 0.0)
-        pstar[perm] = w * p + (1.0 - w) * q
-    # 3複側のブレンドも用意しておく（遊びモード3複用）
+        pstar3t[perm] = w * p + (1.0 - w) * q
+    # 3複側のブレンドも用意（遊びモード3複用）
     q3f = aggregate_to_trio(q3t)
     pstar3f = {}
     p3f_norm = _normalize_weights(np.array([p3f.get(c, 0.0) for c in COMBS_3F]))
@@ -463,23 +510,7 @@ def build_probabilities(snapshot: Snapshot, params: ModelParams) -> Dict[str, Di
         q = float(q3f.get(comb, 0.0))
         pstar3f[comb] = w * p + (1.0 - w) * q
 
-    return {"p3t": p3t, "q3t": q3t, "pstar3t": pstar, "p3f": p3f, "q3f": q3f, "pstar3f": pstar3f}
-
-
-def aggregate_to_trio(prob3t: Dict[Tuple[int, int, int], float]) -> Dict[Tuple[int, int, int], float]:
-    """
-    3単確率から 3複（順序無視）へ集約。
-    """
-    out = {c: 0.0 for c in COMBS_3F}
-    for (a, b, c), val in prob3t.items():
-        comb = tuple(sorted((a, b, c)))
-        out[comb] += float(val)
-    # 正規化
-    s = sum(out.values())
-    if s > 0:
-        for k in out:
-            out[k] /= s
-    return out
+    return {"p3t": p3t, "q3t": q3t, "pstar3t": pstar3t, "p3f": p3f, "q3f": q3f, "pstar3f": pstar3f}
 
 
 # ===== EVモード（勝ち向け） =====
@@ -571,15 +602,13 @@ def allocate_budget(candidates: List[Candidate],
     """
     if race_budget <= 0 or not candidates:
         return []
-    # ケリー素値（縮小後p,oddsで計算）
+    # ケリー素値（ここでは素のp/oddsで計算：縮小は別途ev_shrunkで管理）
     kelly_vals = []
     for c in candidates:
-        p_s, odds_s = _shrink_for_risk(c.p, c.odds, 0.0, 0.0)  # ここでは縮小せず素のp/oddsでも可
-        f = _kelly_fraction(p_s, odds_s)
+        f = _kelly_fraction(c.p, c.odds)
         kelly_vals.append(max(0.0, f))
     arr = np.array(kelly_vals, dtype=float)
     if np.all(arr == 0):
-        # 全て0なら等分（最低限）
         base = np.ones(len(candidates))
     else:
         base = arr
@@ -619,7 +648,7 @@ def marginal_probs_contend(prob3t: Dict[Tuple[int, int, int], float]) -> Dict[in
     for (a, b, c), v in prob3t.items():
         cont[a] += float(v)
         cont[b] += float(v)
-    # 正規化（合計2になるので1に合わせるなら/2）
+    # 合計2になるので1に合わせるなら/2
     s = sum(cont.values())
     if s > 0:
         for k in cont:
