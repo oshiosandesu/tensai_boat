@@ -161,6 +161,25 @@ with k4:
 
 st.markdown("")
 
+# ====== 内部ユーティリティ（当タブ専用） ======
+def _pick_by_k(pmap: Dict, K: int):
+    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
+    chosen = [k for k, _ in items[:K]]
+    hitrate = float(sum(v for _, v in items[:K]))
+    return chosen, hitrate
+
+def _pick_by_target(pmap: Dict, target: float):
+    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
+    s = 0.0
+    chosen = []
+    for k, v in items:
+        chosen.append(k)
+        s += v
+        if s >= target:
+            break
+    return chosen, float(s)
+
+
 # ====== タブ群 ======
 tab1, tab2, tab3, tab4 = st.tabs(["選手比較", "オッズ可視化", "EV（勝ち）", "当てにいく（遊び）"])
 
@@ -285,22 +304,3 @@ with tab4:
     st.markdown(f"**想定的中率（合算）:** {hitrate:.2%}")
     st.caption("※ 遊びモードは“的中体験”重視（ROIは低下し得ます）。")
     st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ====== 内部ユーティリティ（当タブ専用） ======
-def _pick_by_k(pmap: Dict, K: int):
-    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
-    chosen = [k for k, _ in items[:K]]
-    hitrate = float(sum(v for _, v in items[:K]))
-    return chosen, hitrate
-
-def _pick_by_target(pmap: Dict, target: float):
-    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
-    s = 0.0
-    chosen = []
-    for k, v in items:
-        chosen.append(k)
-        s += v
-        if s >= target:
-            break
-    return chosen, float(s)
