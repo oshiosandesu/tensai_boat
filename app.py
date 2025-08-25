@@ -1,11 +1,12 @@
 # app.py
 # 天才ボートくん：単レース画面（PC/スマホ対応ダークUI）
 # - LIVE/SIMデータソース可視化・フォールバック切替（デバッグ）対応版
+# - 🔄 更新ボタンでキャッシュを確実に無効化する refresh_token を追加
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Tuple, List, Dict
 
 from core import (
@@ -108,7 +109,6 @@ with st.container():
     with cols[0]:
         st.markdown("### 🛶 天才ボートくん")
         st.caption("オッズの“歪み”で戦う ｜ EVモード & 当てにいくモード")
-    # 入力
     today = datetime.now()
     with cols[1]:
         date = st.date_input("開催日", value=today.date(), format="YYYY-MM-DD")
@@ -122,13 +122,22 @@ with st.container():
     reload_click = cols[5].button("🔄 更新", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+# ====== 更新ボタンでキャッシュを無効化するトークン ======
+if "refresh_token" not in st.session_state:
+    st.session_state.refresh_token = 0
+if reload_click:
+    st.session_state.refresh_token += 1  # ボタン押下のたびにトークンを変える
+
 # ====== スナップショット取得（30秒キャッシュ） ======
 @st.cache_data(show_spinner=False, ttl=30)
-def _load_snapshot(date_str: str, vid: int, rno: int, allow_sim_flag: bool) -> Snapshot:
+def _load_snapshot(date_str: str, vid: int, rno: int, allow_sim_flag: bool, refresh_token: int) -> Snapshot:
+    # refresh_token はキャッシュキーにだけ使う（中では未使用）
     return fetch_snapshot(date_str, vid, rno, allow_sim_fallback=allow_sim_flag)
 
 date_str = date.strftime("%Y%m%d")
-snapshot: Snapshot = _load_snapshot(date_str, venue_id, race_no, allow_sim_flag=allow_sim)
+snapshot: Snapshot = _load_snapshot(
+    date_str, venue_id, race_no, allow_sim_flag=allow_sim, refresh_token=st.session_state.refresh_token
+)
 
 # ====== モデル確率構築 ======
 params = ModelParams(
@@ -193,14 +202,11 @@ with k4:
     st.markdown(f'<span class="{cls}">相場判定: {tag}</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown("")
-
 # ====== タブ群 ======
 tab1, tab2, tab3, tab4 = st.tabs(["選手比較", "オッズ可視化", "EV（勝ち）", "当てにいく（遊び）"])
 
 # ---- タブ1：選手比較（6カード） ----
 with tab1:
-    # モデル/市場の周辺確率
     head_p = marginal_probs_head(probs["p3t"])
     head_q = marginal_probs_head(probs["q3t"])
     inc_p = marginal_probs_include(probs["p3t"])
@@ -228,7 +234,6 @@ with tab1:
 
 # ---- タブ2：オッズ可視化 ----
 with tab2:
-    # 3複Top10
     trio_probs = []
     for comb in COMBS_3F:
         o = next((x.odds for x in snapshot.odds_trio if x.comb == comb), None)
@@ -245,7 +250,6 @@ with tab2:
     st.bar_chart(df_top10.set_index("組(3複)"))
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 3単 人気分布（市場確率q）
     q_items = sorted(probs["q3t"].items(), key=lambda kv: kv[1], reverse=True)
     ranks = [f"{a}-{b}-{c}" for (a,b,c),_ in q_items[:20]]
     vals = [v for _, v in q_items[:20]]
@@ -295,13 +299,11 @@ with tab4:
     else:
         pmap = probs["pstar3f"]
 
-    # 選抜
     if select_type == "点数で指定":
         chosen, hitrate = _pick_by_k(pmap=pmap, K=int(K))
     else:
         chosen, hitrate = _pick_by_target(pmap=pmap, target=float(target))
 
-    # 表示
     if hit_mode == "3連単":
         label = [f"{a}-{b}-{c}" for (a,b,c) in chosen]
         odds_lookup = {x.comb: x.odds for x in snapshot.odds_trifecta}
