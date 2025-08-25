@@ -1,5 +1,6 @@
 # app.py
 # 天才ボートくん：単レース画面（PC/スマホ対応ダークUI）
+# - LIVE/SIMデータソース可視化・フォールバック切替（デバッグ）対応版
 
 import streamlit as st
 import pandas as pd
@@ -58,6 +59,48 @@ hr.sep { border:none; border-top:1px solid var(--border); margin:10px 0; }
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
+# ====== 内部ユーティリティ（当タブ専用：呼び出し前に定義） ======
+def _pick_by_k(pmap: Dict, K: int):
+    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
+    chosen = [k for k, _ in items[:K]]
+    hitrate = float(sum(v for _, v in items[:K]))
+    return chosen, hitrate
+
+def _pick_by_target(pmap: Dict, target: float):
+    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
+    s = 0.0
+    chosen = []
+    for k, v in items:
+        chosen.append(k)
+        s += v
+        if s >= target:
+            break
+    return chosen, float(s)
+
+# ====== サイドバー（解析パラメータ & デバッグ） ======
+with st.sidebar:
+    st.header("⚙️ 解析パラメータ")
+    alpha_3f = st.slider("3複の厚み α", 0.5, 2.0, 1.0, 0.05)
+    w_blend = st.slider("ブレンド重み w（p寄り）", 0.0, 1.0, 0.6, 0.05)
+    slip = st.slider("スリッページ%", 0.0, 0.05, 0.01, 0.005)
+    lam = st.slider("不確実性λ", 0.0, 0.10, 0.03, 0.005)
+    ev_th = st.slider("EV' 閾値", -0.2, 0.2, 0.03, 0.01)
+    gap_th = st.slider("Edge(p-q) 閾値", -0.05, 0.05, 0.005, 0.001)
+    max_pts = st.slider("最大点数(勝ちモード)", 1, 30, 10, 1)
+    max_pair_head = st.slider("同一(頭-2着)上限", 1, 6, 3, 1)
+    st.caption("※ 変更すると次回更新時に反映")
+
+    st.markdown("---")
+    st.header("💰 資金配分（EVモード）")
+    race_budget = st.number_input("1R上限（円）", min_value=0, max_value=1_000_000, value=5000, step=500)
+    min_unit = st.number_input("最小単位（円）", min_value=100, max_value=10000, value=500, step=100)
+    st.caption("※ 当てにいくモードでは配分は行いません（提案のみ）")
+
+    st.markdown("---")
+    st.header("🛠 デバッグ")
+    allow_sim = st.toggle("シミュレーションフォールバックを許可", value=True,
+                          help="OFFにすると実オッズ取得に失敗した際は空データになります（問題の切り分け用）")
+
 # ====== ヘッダーバー ======
 with st.container():
     st.markdown('<div class="header-bar">', unsafe_allow_html=True)
@@ -77,34 +120,15 @@ with st.container():
     with cols[4]:
         mode = st.segmented_control("モード", options=["EVで勝つ", "当てにいく"], default="EVで勝つ")
     reload_click = cols[5].button("🔄 更新", use_container_width=True)
-
     st.markdown('</div>', unsafe_allow_html=True)
-
-# ====== パラメータ（右サイド軽量UI） ======
-with st.sidebar:
-    st.header("⚙️ 解析パラメータ")
-    alpha_3f = st.slider("3複の厚み α", 0.5, 2.0, 1.0, 0.05)
-    w_blend = st.slider("ブレンド重み w（p寄り）", 0.0, 1.0, 0.6, 0.05)
-    slip = st.slider("スリッページ%", 0.0, 0.05, 0.01, 0.005)
-    lam = st.slider("不確実性λ", 0.0, 0.10, 0.03, 0.005)
-    ev_th = st.slider("EV' 閾値", -0.2, 0.2, 0.03, 0.01)
-    gap_th = st.slider("Edge(p-q) 閾値", -0.05, 0.05, 0.005, 0.001)
-    max_pts = st.slider("最大点数(勝ちモード)", 1, 30, 10, 1)
-    max_pair_head = st.slider("同一(頭-2着)上限", 1, 6, 3, 1)
-    st.caption("※ 変更すると次回更新時に反映")
-    st.markdown("---")
-    st.header("💰 資金配分（EVモード）")
-    race_budget = st.number_input("1R上限（円）", min_value=0, max_value=1_000_000, value=5000, step=500)
-    min_unit = st.number_input("最小単位（円）", min_value=100, max_value=10000, value=500, step=100)
-    st.caption("※ 当てにいくモードでは配分は行いません（提案のみ）")
 
 # ====== スナップショット取得（30秒キャッシュ） ======
 @st.cache_data(show_spinner=False, ttl=30)
-def _load_snapshot(date_str: str, vid: int, rno: int) -> Snapshot:
-    return fetch_snapshot(date_str, vid, rno)
+def _load_snapshot(date_str: str, vid: int, rno: int, allow_sim_flag: bool) -> Snapshot:
+    return fetch_snapshot(date_str, vid, rno, allow_sim_fallback=allow_sim_flag)
 
 date_str = date.strftime("%Y%m%d")
-snapshot: Snapshot = _load_snapshot(date_str, venue_id, race_no)
+snapshot: Snapshot = _load_snapshot(date_str, venue_id, race_no, allow_sim_flag=allow_sim)
 
 # ====== モデル確率構築 ======
 params = ModelParams(
@@ -119,7 +143,7 @@ params = ModelParams(
 )
 probs = build_probabilities(snapshot, params)
 
-# ====== 相場サマリー（トップカード3枚） ======
+# ====== 相場サマリー（トップカード3枚 + 取得ソース） ======
 k1, k2, k3, k4 = st.columns([2,2,2,3])
 with k1:
     st.markdown('<div class="card vstack">', unsafe_allow_html=True)
@@ -136,15 +160,26 @@ with k2:
 with k3:
     st.markdown('<div class="card vstack">', unsafe_allow_html=True)
     q_sum = snapshot.meta.get("book_sum", None)
+    st.caption("ブック合算（参考）")
     if q_sum is not None:
-        st.caption("ブック合算（参考）")
         st.markdown(f"∑1/odds(3単): **{q_sum:.2f}**")
     else:
-        st.caption("ブック合算（参考）")
         st.markdown("—")
     st.markdown('</div>', unsafe_allow_html=True)
 with k4:
     st.markdown('<div class="card hstack">', unsafe_allow_html=True)
+    # データソース表示（LIVE/SIM）
+    src3t = snapshot.meta.get("source_3t", "?")
+    src3f = snapshot.meta.get("source_3f", "?")
+    cnt3t = snapshot.meta.get("count_3t", 0)
+    cnt3f = snapshot.meta.get("count_3f", 0)
+    cls_live3t = "badge good" if str(src3t).startswith("live") else ("badge warn" if src3t == "sim" else "badge")
+    cls_live3f = "badge good" if str(src3f).startswith("live") else ("badge warn" if src3f == "sim" else "badge")
+    st.markdown(f'<span class="{cls_live3t}">3単: {src3t} / {cnt3t}件</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="{cls_live3f}">3複: {src3f} / {cnt3f}件</span>', unsafe_allow_html=True)
+
+    st.markdown('<div style="flex:1"></div>', unsafe_allow_html=True)
+    # 相場判定バッジ
     tag = "標準"
     cov = snapshot.meta.get("coverage_top5_3f", 0.0)
     ent = snapshot.meta.get("entropy_3t", 0.0)
@@ -156,29 +191,9 @@ with k4:
     if tag == "固め": cls += " good"
     if tag == "荒れやすい": cls += " warn"
     st.markdown(f'<span class="{cls}">相場判定: {tag}</span>', unsafe_allow_html=True)
-    st.markdown('<div style="flex:1"></div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown("")
-
-# ====== 内部ユーティリティ（当タブ専用） ======
-def _pick_by_k(pmap: Dict, K: int):
-    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
-    chosen = [k for k, _ in items[:K]]
-    hitrate = float(sum(v for _, v in items[:K]))
-    return chosen, hitrate
-
-def _pick_by_target(pmap: Dict, target: float):
-    items = sorted(pmap.items(), key=lambda kv: kv[1], reverse=True)
-    s = 0.0
-    chosen = []
-    for k, v in items:
-        chosen.append(k)
-        s += v
-        if s >= target:
-            break
-    return chosen, float(s)
-
 
 # ====== タブ群 ======
 tab1, tab2, tab3, tab4 = st.tabs(["選手比較", "オッズ可視化", "EV（勝ち）", "当てにいく（遊び）"])
@@ -213,7 +228,6 @@ with tab1:
 
 # ---- タブ2：オッズ可視化 ----
 with tab2:
-    from collections import defaultdict
     # 3複Top10
     trio_probs = []
     for comb in COMBS_3F:
