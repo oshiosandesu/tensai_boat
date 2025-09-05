@@ -1,8 +1,0 @@
-streamlit>=1.32,<2
-altair>=5,<6
-pandas>=2,<3
-pyjpboatrace==0.4.2
-requests>=2.31,<3
-beautifulsoup4>=4.12,<5
-selenium>=4.10,<5
-matplotlib>=3.8,<4
