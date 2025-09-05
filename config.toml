@@ -1,8 +1,0 @@
-# .streamlit/config.toml
-[theme]
-base = "light"                     # 白ベース
-primaryColor = "#0E7AFE"           # 強調色（ボタン/リンクなど）
-backgroundColor = "#FFFFFF"        # 背景（白）
-secondaryBackgroundColor = "#F7F7FF"  # セクションの薄背景
-textColor = "#111111"              # 文字色（濃いグレー）
-font = "sans serif"                # 読みやすい標準フォント
